@@ -7,6 +7,7 @@ mod demo;
 mod discovery;
 mod lifetime;
 mod model;
+mod orbit;
 mod pricing;
 mod render;
 mod stats;
@@ -83,7 +84,7 @@ struct Cli {
     #[arg(long, value_name = "MS", hide = true)]
     synth: Option<i64>,
 
-    /// Debug: panel for --frame / --probe (main, stats, timeline, lifetime, detail).
+    /// Debug: panel for --frame / --probe (main, orbit, stats, timeline, lifetime, detail).
     #[arg(long, value_name = "NAME", hide = true)]
     panel: Option<String>,
 
@@ -127,8 +128,12 @@ struct Settings {
     pricing: Pricing,
 }
 
+/// Validators are opt-in; the demo shows its own gates when none are set.
+static DEMO_VALIDATORS: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| demo::VALIDATORS.iter().map(|v| v.to_string()).collect());
+
 impl Settings {
-    fn view<'a>(&self, calm: bool, panel: Panel, lifetime: Option<&'a lifetime::Totals>) -> View<'a> {
+    fn view<'a>(&'a self, calm: bool, panel: Panel, lifetime: Option<&'a lifetime::Totals>) -> View<'a> {
         View {
             calm,
             cost: self.cfg.cost,
@@ -140,6 +145,19 @@ impl Settings {
             lifetime: if self.cfg.persistence { lifetime } else { None },
             selected: None,
             stuck_ms: self.cfg.stuck_after.saturating_mul(1000).min(i64::MAX as u64) as i64,
+            base: if render::VIEWS.iter().any(|(p, _)| *p == panel) { panel } else { Panel::Main },
+            term: (0, 0),
+            validators: &self.cfg.validators,
+        }
+    }
+
+    /// The configured validators, or the demo's when replaying the scripted
+    /// session with none configured.
+    fn validators(&self, sess: &model::Session) -> &[String] {
+        if !sess.live && self.cfg.validators.is_empty() {
+            &DEMO_VALIDATORS
+        } else {
+            &self.cfg.validators
         }
     }
 }
@@ -182,6 +200,7 @@ fn main() -> io::Result<()> {
         Some("timeline") => Panel::Timeline,
         Some("lifetime") => Panel::Lifetime,
         Some("detail") => Panel::Detail,
+        Some("orbit") => Panel::Orbit,
         _ => Panel::Main,
     };
     let store = lifetime::Store::load(&lifetime::path());
@@ -191,6 +210,7 @@ fn main() -> io::Result<()> {
         recap: set.cfg.recap && render::recap_due(sess, t),
         footer: app_t < HINT.as_millis() as i64,
         selected: cli.select,
+        validators: set.validators(sess),
         ..set.view(cli.calm, panel, Some(&totals))
     };
 
@@ -345,6 +365,11 @@ fn leave(term: &mut Term) -> io::Result<()> {
     execute!(term.backend_mut(), terminal::LeaveAlternateScreen, cursor::Show)
 }
 
+/// Terminal (columns, rows), for layouts that adapt to it.
+fn term_size(term: &Term) -> (u16, u16) {
+    term.size().map_or((0, 0), |s| (s.width, s.height))
+}
+
 /// Draw the frame centered in the terminal.
 fn paint(term: &mut Term, lines: Vec<Line<'static>>, width: i64) -> io::Result<()> {
     let height = (lines.len() as u16).max(render::H);
@@ -363,7 +388,10 @@ fn paint(term: &mut Term, lines: Vec<Line<'static>>, width: i64) -> io::Result<(
 
 struct Ui {
     calm: bool,
+    /// what's on screen: a base view, or a panel (stats, detail, …) over it
     panel: Panel,
+    /// the view `v` cycles: tree (`Main`) → orbit → timeline
+    base: Panel,
     /// when the key hints were last asked for (startup counts)
     hint_at: Instant,
     /// the `all` value whose recap was dismissed, so a later batch of agents
@@ -383,7 +411,7 @@ enum Key {
 
 impl Ui {
     fn new(calm: bool) -> Self {
-        Ui { calm, panel: Panel::Main, hint_at: Instant::now(), recap_dismissed: None, selected: None }
+        Ui { calm, panel: Panel::Main, base: Panel::Main, hint_at: Instant::now(), recap_dismissed: None, selected: None }
     }
 
     fn recap_showing(&self, set: &Settings, sess: &model::Session, t: i64) -> bool {
@@ -393,13 +421,29 @@ impl Ui {
             && self.recap_dismissed != Some(sess.all)
     }
 
-    fn view<'a>(&self, set: &Settings, sess: &model::Session, t: i64, life: Option<&'a lifetime::Totals>) -> View<'a> {
+    fn view<'a>(
+        &self,
+        set: &'a Settings,
+        sess: &model::Session,
+        t: i64,
+        life: Option<&'a lifetime::Totals>,
+        term: (u16, u16),
+    ) -> View<'a> {
         View {
             recap: self.recap_showing(set, sess, t),
             footer: self.hint_at.elapsed() < HINT,
             selected: self.selected.filter(|i| *i < sess.agents.len()),
+            base: self.base,
+            term,
+            validators: set.validators(sess),
             ..set.view(self.calm, self.panel, life)
         }
+    }
+
+    /// Show a base view (tree, orbit or timeline), closing any panel over it.
+    fn show(&mut self, base: Panel) {
+        self.base = base;
+        self.panel = base;
     }
 
     fn key(&mut self, k: KeyEvent, set: &Settings, sess: &model::Session, t: i64) -> Key {
@@ -412,18 +456,30 @@ impl Ui {
             self.recap_dismissed = Some(sess.all);
             return Key::Done;
         }
-        let toggle = |cur: Panel, p: Panel| if cur == p { Panel::Main } else { p };
+        let base = self.base;
+        let toggle = |cur: Panel, p: Panel| if cur == p { base } else { p };
         match k.code {
             KeyCode::Char('q') => Key::Quit,
-            KeyCode::Esc if self.panel != Panel::Main => {
-                self.panel = Panel::Main;
+            // Esc backs out one step: a panel → its view → no selection →
+            // the tree → quit.
+            KeyCode::Esc if self.panel != self.base => {
+                self.panel = self.base;
                 Key::Done
             }
             KeyCode::Esc if self.selected.is_some() => {
                 self.selected = None;
                 Key::Done
             }
+            KeyCode::Esc if self.base != Panel::Main => {
+                self.show(Panel::Main);
+                Key::Done
+            }
             KeyCode::Esc => Key::Quit,
+            KeyCode::Char('v') => {
+                let i = render::VIEWS.iter().position(|(p, _)| *p == self.base).unwrap_or(0);
+                self.show(render::VIEWS[(i + 1) % render::VIEWS.len()].0);
+                Key::Done
+            }
             KeyCode::Up | KeyCode::Down => {
                 self.step(k.code == KeyCode::Down, sess, t);
                 Key::Done
@@ -446,7 +502,7 @@ impl Ui {
                 Key::Done
             }
             KeyCode::Char('t') => {
-                self.panel = toggle(self.panel, Panel::Timeline);
+                self.show(if self.panel == Panel::Timeline { Panel::Main } else { Panel::Timeline });
                 Key::Done
             }
             KeyCode::Char('l') => {
@@ -517,7 +573,7 @@ fn run_demo(sess: &model::Session, set: &Settings, calm: bool) -> io::Result<()>
                 ui.recap_dismissed = None; // new loop: the recap comes back
             }
             last_t = t;
-            let view = ui.view(set, sess, t, None);
+            let view = ui.view(set, sess, t, None, term_size(&term));
             paint(&mut term, render::frame(sess, t, t, &view, &mut rng), render::width(&view))?;
             let Some(k) = next_key(Duration::from_millis(50))? else {
                 continue;
@@ -611,7 +667,7 @@ fn run_live(
                         sess = live.build(&set.pricing);
                         app_start = Instant::now(); // replay the header intro
                         ui.selected = None;
-                        ui.panel = Panel::Main;
+                        ui.panel = ui.base;
                     }
                 }
             }
@@ -623,7 +679,7 @@ fn run_live(
             }
             let t = live.clock();
             let app_t = app_start.elapsed().as_millis() as i64;
-            let view = ui.view(set, &sess, t, Some(&persist.totals));
+            let view = ui.view(set, &sess, t, Some(&persist.totals), term_size(&term));
             paint(&mut term, render::frame(&sess, t, app_t, &view, &mut rng), render::width(&view))?;
             let Some(k) = next_key(Duration::from_millis(50))? else {
                 continue;
@@ -773,7 +829,7 @@ mod tests {
         assert!(!Ui::new(false).recap_showing(&set2, &sess, done));
         // ↑/↓ select, Enter opens the detail panel, Esc backs out, Esc again clears
         let mut ui = Ui::new(false);
-        let mid = 6_000; // all three demo agents have started
+        let mid = 5_000; // the first three demo agents have started, the reviewer hasn't
         ui.key(press(KeyCode::Down), &set, &sess, mid);
         assert_eq!(ui.selected, Some(0));
         ui.key(press(KeyCode::Down), &set, &sess, mid);
@@ -793,10 +849,52 @@ mod tests {
         ui.key(press(KeyCode::Enter), &set, &sess, 0);
         assert_eq!((ui.panel, ui.selected), (Panel::Main, None));
 
+        // v cycles tree → orbit → timeline; Enter opens the detail view over
+        // the current one and Esc returns to it
+        let mut ui = Ui::new(false);
+        ui.key(press(KeyCode::Char('v')), &set, &sess, mid);
+        assert_eq!((ui.base, ui.panel), (Panel::Orbit, Panel::Orbit));
+        ui.key(press(KeyCode::Down), &set, &sess, mid);
+        ui.key(press(KeyCode::Down), &set, &sess, mid);
+        assert_eq!(ui.selected, Some(1), "↑/↓ work in the orbit");
+        ui.key(press(KeyCode::Enter), &set, &sess, mid);
+        assert_eq!((ui.base, ui.panel), (Panel::Orbit, Panel::Detail));
+        ui.key(press(KeyCode::Esc), &set, &sess, mid);
+        assert_eq!(ui.panel, Panel::Orbit, "back to the orbit, not the tree");
+        ui.key(press(KeyCode::Char('v')), &set, &sess, mid);
+        assert_eq!(ui.panel, Panel::Timeline);
+        ui.key(press(KeyCode::Char('s')), &set, &sess, mid);
+        ui.key(press(KeyCode::Char('s')), &set, &sess, mid);
+        assert_eq!(ui.panel, Panel::Timeline, "closing a panel returns to the view");
+        ui.key(press(KeyCode::Char('v')), &set, &sess, mid);
+        assert_eq!((ui.base, ui.panel), (Panel::Main, Panel::Main), "and around to the tree");
+        // Esc steps back: selection, then the view, then quits
+        ui.key(press(KeyCode::Char('v')), &set, &sess, mid);
+        ui.key(press(KeyCode::Esc), &set, &sess, mid);
+        assert_eq!((ui.panel, ui.selected), (Panel::Orbit, None));
+        ui.key(press(KeyCode::Esc), &set, &sess, mid);
+        assert_eq!(ui.panel, Panel::Main);
+        assert!(matches!(ui.key(press(KeyCode::Esc), &set, &sess, mid), Key::Quit));
+
         // ctrl-c always quits, recap or not
         let mut ui = Ui::new(false);
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(ui.key(ctrl_c, &set, &sess, done), Key::Quit));
+    }
+
+    /// Validators are opt-in: none for a live session unless configured; the
+    /// demo shows its own so the gates are on display.
+    #[test]
+    fn validators_are_opt_in() {
+        let cfg = Config::default();
+        let mut set = Settings { pricing: Pricing::new(&cfg.pricing), cfg };
+        let demo = demo::session("h".into(), &set.pricing);
+        let live = demo::synth("h".into());
+        assert!(set.validators(&live).is_empty());
+        assert_eq!(set.validators(&demo), ["test-runner", "reviewer"]);
+        set.cfg.validators = vec!["qa".into()];
+        assert_eq!(set.validators(&live), ["qa"]);
+        assert_eq!(set.validators(&demo), ["qa"], "a configured list wins in the demo too");
     }
 
     /// Synthetic ~/.claude/projects: a stale session and a fresh one in the same

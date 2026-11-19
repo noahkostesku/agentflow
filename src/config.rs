@@ -30,6 +30,9 @@ pub struct Config {
     /// seconds without transcript activity before a running agent reads as
     /// stuck (sleepy face, "idle 2m"); 0 turns it off
     pub stuck_after: u64,
+    /// optional: roles the orbit view labels as pass/fail gates (display
+    /// only; agentflow is read-only and never gates anything). Empty = none.
+    pub validators: Vec<String>,
     /// USD per million tokens, keyed by model id or family
     pub pricing: HashMap<String, RatesOverride>,
 }
@@ -44,6 +47,7 @@ impl Default for Config {
             persistence: true,
             accent: format!("#{DEFAULT_ACCENT:06x}"),
             stuck_after: (crate::stats::STUCK_MS / 1000) as u64,
+            validators: Vec::new(),
             pricing: HashMap::new(),
         }
     }
@@ -62,6 +66,7 @@ pub const DEFAULT_FILE: &str = r##"# agentflow config. Uncomment a line to chang
 # persistence = true    # keep lifetime totals in ~/.agentflow/lifetime.json
 # accent = "#c4a5b4"    # the one accent color (dusty mauve)
 # stuck_after = 120     # seconds of silence before an agent reads "idle" (0 = off)
+# validators = ["test-runner", "reviewer"]  # optional: label these roles pass/fail in orbit
 
 # Pricing overrides, USD per million tokens. Key by family (opus, sonnet,
 # haiku, fable) or exact model id. Unset fields keep the built-in rate (see
@@ -166,6 +171,7 @@ mod tests {
             flashes = false
             accent = "#88c0d0"
             stuck_after = 45
+            validators = ["qa"]
 
             [pricing.opus]
             input = 1.5
@@ -180,6 +186,8 @@ mod tests {
         assert!(cfg.recap && cfg.cost && cfg.persistence, "unset keys keep defaults");
         assert_eq!(cfg.accent_rgb(), 0x88c0d0);
         assert_eq!(cfg.stuck_after, 45);
+        assert_eq!(cfg.validators, vec!["qa".to_string()]);
+        assert!(Config::default().validators.is_empty(), "opt-in");
         assert_eq!(cfg.pricing["opus"].input, Some(1.5));
         assert_eq!(cfg.pricing["opus"].output, None);
         assert_eq!(cfg.pricing["claude-haiku-5-5"].output, Some(0.75));

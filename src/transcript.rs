@@ -17,6 +17,10 @@
 //! launch result, or (2) matching its first message against the spawn's prompt.
 //! Everything is keyed by the spawn's `tool_use` id. Timestamps are epoch ms;
 //! the render clock is `now - t0`, where `t0` is the earliest spawn.
+//!
+//! Handoffs (orbit chords) come from two places: a finished agent's result
+//! quoted in a later agent's prompt (`orbit::detect_handoffs`), and, for agent
+//! teams, a teammate's `SendMessage` call addressed to another teammate.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -73,6 +77,10 @@ struct Acc {
     result: Option<String>,
     /// latest assistant text, the fallback result preview
     last_text: String,
+    /// teammate name given at spawn (`input.name`), for message routing
+    alias: String,
+    /// direct teammate messages it sent: (ts, recipient, bytes)
+    messages: Vec<(i64, String, usize)>,
 }
 
 /// message id -> (first seen ms, usage, model)
@@ -172,6 +180,9 @@ impl Live {
                         let acc = self.ensure(id, &atype, &field("description"));
                         if acc.prompt.is_empty() {
                             acc.prompt = field("prompt");
+                        }
+                        if acc.alias.is_empty() {
+                            acc.alias = field("name");
                         }
                         if acc.spawn_ms.is_none() {
                             acc.spawn_ms = noticed(ts);
@@ -363,6 +374,9 @@ impl Live {
                             continue;
                         }
                         let tts = ts.unwrap_or_else(now_ms);
+                        if let Some((to, len)) = team_message(name, block) {
+                            acc.messages.push((noticed(ts).unwrap_or(tts), to, len));
+                        }
                         acc.denied = false; // it moved on: not stuck on the denial
                         acc.tools.push((
                             tts,
@@ -437,15 +451,20 @@ impl Live {
 
     /// Build the render model for the current instant.
     pub fn build(&self, pricing: &Pricing) -> Session {
-        let mut accs: Vec<&Acc> = self.accs.values().collect();
-        accs.sort_by_key(|a| (a.spawn_ms.or(a.first_ts).unwrap_or(i64::MAX), a.order));
+        let mut accs: Vec<(&str, &Acc)> = self.accs.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        accs.sort_by_key(|(_, a)| (a.spawn_ms.or(a.first_ts).unwrap_or(i64::MAX), a.order));
 
         let now = now_ms();
         let t0 = self.origin().unwrap_or(now);
+        // spawn tool_use id -> agentIds of its transcript
+        let mut agent_ids: HashMap<&str, Vec<String>> = HashMap::new();
+        for (aid, tid) in &self.linked {
+            agent_ids.entry(tid.as_str()).or_default().push(aid.clone());
+        }
 
         let mut agents = Vec::new();
         let mut events: Vec<Event> = Vec::new();
-        for a in &accs {
+        for &(key, a) in &accs {
             let role = role_name(&a.agent_type, &a.description);
             let spawn_ms = a.spawn_ms.or(a.first_ts).unwrap_or(t0);
             let spawn = spawn_ms - t0;
@@ -541,6 +560,47 @@ impl Live {
                     (a.finished && !a.last_text.trim().is_empty()).then(|| a.last_text.clone())
                 }),
                 last_seen: a.last_ts.map(|l| l - t0),
+                in_flight: if a.finished {
+                    None
+                } else {
+                    a.pending.iter().map(|(_, ts, _)| *ts).min().map(|ts| ts - t0)
+                },
+                prompt: a.prompt.clone(),
+                ids: std::iter::once(key.to_string())
+                    .chain(agent_ids.get(key).cloned().unwrap_or_default())
+                    .collect(),
+            });
+        }
+
+        // Handoffs: results quoted in a later prompt, plus teammate messages.
+        let mut handoffs = crate::orbit::detect_handoffs(&agents);
+        for (from, (_, a)) in accs.iter().enumerate() {
+            for (ts, to, len) in &a.messages {
+                let target = to.trim().to_lowercase();
+                let hit = accs.iter().enumerate().find(|(j, (_, b))| {
+                    *j != from
+                        && (b.alias.to_lowercase() == target
+                            || agents[*j].name == target
+                            || b.agent_type.to_lowercase() == target)
+                });
+                if let Some((to, _)) = hit {
+                    handoffs.push(crate::model::Handoff {
+                        from,
+                        to,
+                        time: ts - t0,
+                        what: "message".into(),
+                        size: human_size(*len),
+                    });
+                }
+            }
+        }
+        handoffs.sort_by_key(|h| h.time);
+        for h in &handoffs {
+            events.push(Event {
+                time: h.time,
+                label: format!("{} \u{2192} {}", agents[h.from].name, agents[h.to].name),
+                detail: format!("{} {}", h.what, h.size),
+                color: theme::B,
             });
         }
 
@@ -567,6 +627,7 @@ impl Live {
             orch_model: pricing::family(&self.orch_model),
             orch_calls: priced(&self.orch_usage, t0, pricing),
             epoch0: Some(t0),
+            handoffs,
         }
     }
 
@@ -647,6 +708,28 @@ fn priced(calls: &Usage_, t0: i64, pricing: &Pricing) -> Vec<Call> {
         .collect();
     v.sort_by_key(|c| c.time);
     v
+}
+
+/// A direct message from one teammate to another (agent teams): the
+/// recipient and the body's size. Tolerant of field names, since the tool's
+/// input shape isn't documented: `to` / `recipient` / `target`, and
+/// `message` / `content` / `text`. Broadcasts ("*", "all", "team") are not
+/// one-to-one handoffs and are skipped.
+fn team_message(name: &str, block: &Value) -> Option<(String, usize)> {
+    if !matches!(name, "SendMessage" | "SendMessageToTeammate" | "MessageTeammate") {
+        return None;
+    }
+    let get = |k: &str| block.pointer(&format!("/input/{k}"));
+    let to = ["to", "recipient", "target", "teammate"]
+        .iter()
+        .find_map(|k| get(k).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !matches!(*t, "*" | "all" | "team" | "everyone"))?;
+    let len = ["message", "content", "text", "body"]
+        .iter()
+        .find_map(|k| get(k))
+        .map_or(0, |v| v.as_str().map_or_else(|| v.to_string().len(), str::len));
+    Some((to.to_string(), len))
 }
 
 /// Tools that modify files.
@@ -1112,6 +1195,63 @@ mod tests {
         // the latest entry of any kind (here a tool_result at 00:00:04) is activity
         assert_eq!(a.last_seen, Some(4_000));
         assert!(a.result.is_none(), "still running: no result yet");
+    }
+
+    /// Live: a tool call with no result yet is in flight; a result quoted in
+    /// the next spawn's prompt is a handoff; a teammate's SendMessage to
+    /// another teammate is one too.
+    #[test]
+    fn in_flight_calls_handoffs_and_team_messages() {
+        let dir = std::env::temp_dir().join(format!("aflow-handoff-{}", std::process::id()));
+        let sub = dir.join("sess").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let main = dir.join("sess.jsonl");
+        let review = "Verdict: changes requested\\n- parse_header() splits on every colon and truncates values\\n- no regression test covers a value like Host: a:b";
+        let lines = [
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":[{"type":"tool_use","id":"toolu_R","name":"Agent","input":{"subagent_type":"reviewer","name":"rev","description":"review","prompt":"review the parser"}}]}}"#.to_string(),
+            format!(r#"{{"type":"user","timestamp":"2026-01-01T00:00:05.000Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_R","content":"{review}"}}]}}}}"#),
+            format!(r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:06.000Z","message":{{"content":[{{"type":"tool_use","id":"toolu_F","name":"Agent","input":{{"subagent_type":"fixer","name":"fix","description":"fix","prompt":"Fix these findings:\n\n{review}"}}}}]}}}}"#),
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:06.100Z","toolUseResult":{"status":"async_launched","agentId":"f1"},"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_F","content":"launched"}]}}"#.to_string(),
+        ];
+        std::fs::write(&main, lines.join("\n") + "\n").unwrap();
+        let sub_lines = [
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:06.200Z","message":{"content":"x"}}"#,
+            // a message to the reviewer teammate, then a build that never returns
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:07.000Z","message":{"content":[{"type":"tool_use","id":"m1","name":"SendMessage","input":{"to":"rev","message":"is a:b the only case?"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:07.100Z","message":{"content":[{"type":"tool_result","tool_use_id":"m1","content":"sent"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:08.000Z","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"cargo build --release"}}]}}"#,
+        ];
+        std::fs::write(sub.join("agent-f1.jsonl"), sub_lines.join("\n") + "\n").unwrap();
+
+        let resolved = Resolved { path: main, project_dir: None, fell_back: false };
+        let mut live = Live::new(&resolved, "h".into());
+        live.refresh();
+        let s = live.build(&Pricing::default());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(s.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["reviewer", "fixer"]);
+        let (rev, fix) = (&s.agents[0], &s.agents[1]);
+        assert!(rev.in_flight.is_none(), "finished");
+        assert_eq!(fix.in_flight, Some(8_000), "the build has no result yet");
+        assert!(fix.ids.contains(&"toolu_F".to_string()) && fix.ids.contains(&"f1".to_string()));
+        // stuck forever by the clock, but busy: running, not dozing
+        let t = 8_000 + 600_000;
+        assert!(crate::stats::stuck_idle(fix, t, 120_000).is_none());
+        assert!(crate::stats::running_long(fix, t, 120_000).is_some());
+
+        let hs: Vec<(usize, usize, i64, &str)> =
+            s.handoffs.iter().map(|h| (h.from, h.to, h.time, h.what.as_str())).collect();
+        assert_eq!(hs, vec![(0, 1, 6_000, "findings"), (1, 0, 7_000, "message")]);
+        assert!(s.events.iter().any(|e| e.label == "reviewer \u{2192} fixer" && e.detail.starts_with("findings")));
+    }
+
+    #[test]
+    fn team_message_shapes() {
+        let msg = |input: Value| serde_json::json!({"type": "tool_use", "name": "SendMessage", "input": input});
+        assert_eq!(team_message("SendMessage", &msg(serde_json::json!({"to": "qa", "message": "hi"}))), Some(("qa".into(), 2)));
+        assert_eq!(team_message("SendMessage", &msg(serde_json::json!({"recipient": "qa", "content": "abc"}))), Some(("qa".into(), 3)));
+        assert_eq!(team_message("SendMessage", &msg(serde_json::json!({"to": "*", "message": "all"}))), None, "broadcast");
+        assert_eq!(team_message("Bash", &msg(serde_json::json!({"to": "qa"}))), None);
     }
 
     #[test]

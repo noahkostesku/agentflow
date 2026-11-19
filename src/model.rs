@@ -137,6 +137,13 @@ pub struct Agent {
     /// session ms of its latest transcript entry of any kind (live only; the
     /// demo derives activity from its calls and tool uses)
     pub last_seen: Option<i64>,
+    /// session ms when its oldest still-unanswered tool call started (a
+    /// tool_use with no tool_result yet). Busy, not stuck.
+    pub in_flight: Option<i64>,
+    /// the full prompt it was spawned with (handoff detection)
+    pub prompt: String,
+    /// ids another agent's prompt may quote: spawn tool_use id, agentId
+    pub ids: Vec<String>,
 }
 
 /// Rarity by model family: (glyph, name). haiku common, sonnet rare,
@@ -165,6 +172,21 @@ impl Agent {
         }
         u
     }
+}
+
+/// One agent's output fed straight to another: its result quoted in the next
+/// agent's prompt, or a direct teammate message. Drawn as a chord in the orbit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Handoff {
+    /// indexes into `Session::agents`
+    pub from: usize,
+    pub to: usize,
+    /// session ms the data moved (the receiver's spawn, or the message time)
+    pub time: i64,
+    /// what moved: "findings", "patch", "result", "message"
+    pub what: String,
+    /// "1.4kb"
+    pub size: String,
 }
 
 /// A line in the scrolling handoff/tool log.
@@ -196,6 +218,8 @@ pub struct Session {
     pub orch_calls: Vec<Call>,
     /// epoch ms of session time 0 (live only): places activity in wall-clock hours
     pub epoch0: Option<i64>,
+    /// agent → agent handoffs, in time order
+    pub handoffs: Vec<Handoff>,
 }
 
 impl Session {

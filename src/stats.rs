@@ -405,14 +405,35 @@ pub fn last_activity(a: &Agent, t: i64) -> i64 {
     last
 }
 
-/// How long a still-running agent has been silent, if at least `after_ms`.
-/// Finished and errored agents are never stuck; `after_ms <= 0` disables it.
-pub fn stuck_idle(a: &Agent, t: i64, after_ms: i64) -> Option<i64> {
+/// Silent for at least `after_ms` while still running: how long, in ms.
+/// Finished and errored agents never are; `after_ms <= 0` disables it.
+fn quiet_for(a: &Agent, t: i64, after_ms: i64) -> Option<i64> {
     if after_ms <= 0 || a.error || t < a.spawn || a.finish.is_some_and(|f| f <= t) {
         return None;
     }
     let idle = t - last_activity(a, t);
     (idle >= after_ms).then_some(idle)
+}
+
+/// A tool call it made is still waiting for its result at `t`.
+pub fn in_flight(a: &Agent, t: i64) -> bool {
+    a.in_flight.is_some_and(|s| s <= t)
+}
+
+/// How long a still-running agent has been silent, if at least `after_ms`
+/// and nothing is in flight: it is dozing, not waiting on a slow command.
+pub fn stuck_idle(a: &Agent, t: i64, after_ms: i64) -> Option<i64> {
+    if in_flight(a, t) {
+        return None;
+    }
+    quiet_for(a, t, after_ms)
+}
+
+/// Silent past the threshold *with* a tool call in flight (a slow build, a
+/// long test run): busy, not stuck. Returns how long that call has run.
+pub fn running_long(a: &Agent, t: i64, after_ms: i64) -> Option<i64> {
+    let start = a.in_flight.filter(|s| *s <= t)?;
+    quiet_for(a, t, after_ms).map(|_| t - start)
 }
 
 /// Most agents running at the same moment, by `t`.
@@ -489,6 +510,32 @@ mod tests {
         // threshold from config
         assert_eq!(stuck_idle(&a, 230_000, 30_000), Some(30_000));
         assert_eq!(stuck_idle(&a, 230_000, 0), None, "0 disables");
+    }
+
+    /// A tool call still in flight (tool_use, no tool_result yet) means busy:
+    /// "running 2m", never the sleepy face. Only silence with nothing in
+    /// flight reads as stuck.
+    #[test]
+    fn in_flight_tool_call_is_running_not_stuck() {
+        let mut a = agent("builder", 0, None);
+        a.last_seen = Some(1_000);
+        a.in_flight = Some(1_000); // `cargo build` issued at 1s, no result yet
+        let t = 1_000 + 150_000;
+        assert_eq!(stuck_idle(&a, t, STUCK_MS), None, "in flight: not stuck");
+        assert_eq!(running_long(&a, t, STUCK_MS), Some(150_000));
+        assert_eq!(running_long(&a, 60_000, STUCK_MS), None, "not quiet long enough yet");
+        assert_eq!(running_long(&a, t, 0), None, "0 disables");
+        // the result comes back: nothing in flight, silence is stuck again
+        a.in_flight = None;
+        assert_eq!(stuck_idle(&a, t, STUCK_MS), Some(150_000));
+        assert_eq!(running_long(&a, t, STUCK_MS), None);
+        // a call issued after `t` isn't in flight yet at `t`
+        a.in_flight = Some(t + 1);
+        assert!(stuck_idle(&a, t, STUCK_MS).is_some());
+        // finished agents are neither
+        a.in_flight = Some(1_000);
+        a.finish = Some(100_000);
+        assert_eq!(running_long(&a, t, STUCK_MS), None);
     }
 
     #[test]

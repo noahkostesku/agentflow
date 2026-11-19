@@ -46,7 +46,12 @@ pub enum Panel {
     Lifetime,
     /// one agent up close (the selected one)
     Detail,
+    /// orchestrator at the center, agents on a ring (see `orbit`)
+    Orbit,
 }
+
+/// The three views `v` cycles through, as shown in the header switcher.
+pub const VIEWS: [(Panel, &str); 3] = [(Panel::Main, "tree"), (Panel::Orbit, "orbit"), (Panel::Timeline, "timeline")];
 
 /// Display options and UI state for one frame.
 #[derive(Clone, Copy, Default)]
@@ -68,6 +73,13 @@ pub struct View<'a> {
     pub selected: Option<usize>,
     /// silence before a running agent reads as stuck (ms; 0 = off)
     pub stuck_ms: i64,
+    /// the view (tree / orbit / timeline) the switcher marks; panels like
+    /// stats or detail open on top of it
+    pub base: Panel,
+    /// terminal (columns, rows); `(0, 0)` = unknown, assume roomy
+    pub term: (u16, u16),
+    /// roles drawn as pass/fail gates in the orbit
+    pub validators: &'a [String],
 }
 
 /// Content width for these options.
@@ -80,7 +92,7 @@ pub fn recap_due(sess: &Session, t: i64) -> bool {
     sess.all != i64::MAX && t >= sess.all.saturating_add(RECAP_DELAY)
 }
 
-const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+pub(crate) const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 fn sp<S: Into<String>>(s: S, c: Color) -> Span<'static> {
     Span::styled(s.into(), Style::default().fg(c))
@@ -140,6 +152,19 @@ fn glitch(s: &str, calm: bool, rng: &mut impl Rng) -> String {
             }
         })
         .collect()
+}
+
+/// Current tool: real (live) or time-cycled (demo, a tool every 1.6s once it
+/// has booted). May be absent early in live mode.
+pub(crate) fn current_tool(a: &Agent, t: i64) -> Option<&Tool> {
+    if a.tools.is_empty() {
+        None
+    } else if let Some(i) = a.live_tool {
+        Some(&a.tools[i.min(a.tools.len() - 1)])
+    } else {
+        let k = ((t - a.spawn - 1300).max(0) / 1600) as usize;
+        Some(&a.tools[k % a.tools.len()])
+    }
 }
 
 /// Build one subagent row. Port of `row(a,t,last)`, generalized for live mode.
@@ -207,9 +232,12 @@ fn row(
     let ret = matches!(fo, Some(f) if t >= f && t < f + 400);
     let dim = matches!(fo, Some(f) if t >= f + 1700);
     let boot = r < 1300;
-    // Silent for a while: sleepy instead of busy (overrides "waiting").
+    // Silent for a while: sleepy instead of busy (overrides "waiting")…
     let stuck = if boot { None } else { stats::stuck_idle(a, t, view.stuck_ms) };
-    let wait = stuck.is_some() || a.wait.is_some_and(|(ws, we)| t >= ws && t < we);
+    // …unless a tool call is still in flight: then it's a long-running
+    // command, so it reads "running 2m" with a slow spinner, awake.
+    let running = if boot { None } else { stats::running_long(a, t, view.stuck_ms) };
+    let wait = running.is_none() && (stuck.is_some() || a.wait.is_some_and(|(ws, we)| t >= ws && t < we));
     // ~300ms glitch the moment an error lands (spec: "Error: ~300ms glitch").
     let glitching =
         a.error && !calm && a.error_at.is_some_and(|e| t >= e && t < e + 300);
@@ -253,15 +281,7 @@ fn row(
     let badge = if shown > clen(&a.name) { a.model.as_str() } else { "" };
     s.push(sp(pad(badge, BADGE as usize), if dim { VD } else { D }));
 
-    // Current tool: real (live) or time-cycled (demo). May be absent early live.
-    let tl: Option<&Tool> = if a.tools.is_empty() {
-        None
-    } else if let Some(i) = a.live_tool {
-        Some(&a.tools[i.min(a.tools.len() - 1)])
-    } else {
-        let k = ((t - act).max(0) / 1600) as usize;
-        Some(&a.tools[k % a.tools.len()])
-    };
+    let tl = current_tool(a, t);
 
     // Face reacts to phase and tool kind.
     let face;
@@ -302,6 +322,8 @@ fn row(
     } else if let Some(idle) = stuck {
         st = idle_label(idle);
         sc = AM;
+    } else if let Some(ms) = running {
+        st = running_label(ms);
     } else if wait {
         // Live mode can't tell *why* a call is blocked, so it says "waiting";
         // the scripted demo knows its wait is a permission prompt.
@@ -324,7 +346,9 @@ fn row(
     // Spinner / sparkle cell.
     let mut s1 = " ".to_string();
     if !boot && !done && !wait && !ret && !a.error {
-        s1 = SPIN[((t / 80 + a.bob).rem_euclid(10)) as usize].to_string();
+        // a long-running call spins slowly
+        let step = if running.is_some() { 400 } else { 80 };
+        s1 = SPIN[((t / step + a.bob).rem_euclid(10)) as usize].to_string();
     }
     if let Some(f) = fo {
         if t >= f + 700 && t < f + 1100 {
@@ -430,9 +454,13 @@ pub fn frame(
     };
     let total = (view.cost && !linking).then(|| format!("{} · ", fmt_cost(sess.cost_at(t))));
     let lt = format!(" {}{}", shown, cur);
-    let rt_len = clen(&rt) + total.as_ref().map_or(0, |s| clen(s));
+    // View switcher "v  tree · orbit · timeline", the current one in the accent.
+    let switcher = (!linking).then(|| view_switcher(view));
+    let sw_len = switcher.as_ref().map_or(0, |v| v.iter().map(|s| clen(&s.content)).sum::<usize>());
+    let rt_len = clen(&rt) + total.as_ref().map_or(0, |s| clen(s)) + sw_len;
     let mid_w = (w as usize).saturating_sub(10).saturating_sub(rt_len);
     let mut hdr = vec![sp(ctake(&lt, 10), ac()), sp(pad(&cfrom(&lt, 10), mid_w), G)];
+    hdr.extend(switcher.unwrap_or_default());
     if let Some(total) = total {
         hdr.push(sp(total, G));
     }
@@ -450,6 +478,20 @@ pub fn frame(
         format!(" {}", dashes),
         if app_t < 600 { ac() } else { D },
     )));
+
+    // --- Orbit: its own grid and "latest" line in place of everything below,
+    // or the tree when the terminal is too small for the ring.
+    let mut orbit_fallback = false;
+    if view.panel == Panel::Orbit {
+        if let Some((grid, latest)) = crate::orbit::panel(sess, t, view, w) {
+            out.extend(grid);
+            out.push(bottom_rule(sess, t, view, w));
+            out.push(latest);
+            out.push(if view.footer { footer_line() } else { Line::from("") });
+            return out;
+        }
+        orbit_fallback = true;
+    }
 
     out.push(Line::from(""));
 
@@ -498,7 +540,7 @@ pub fn frame(
     // --- Middle: 10 lines of tree + log, or a panel.
     let vis = visible_agents(sess, t, view.selected);
     let mid = match view.panel {
-        Panel::Main => main_panel(sess, t, &vis, view, w, rng),
+        Panel::Main | Panel::Orbit => main_panel(sess, t, &vis, view, w, rng),
         Panel::Stats => stats_panel(sess, t, &vis, view, w),
         Panel::Timeline => timeline_panel(sess, t, view, w),
         Panel::Lifetime => lifetime_panel(view, w),
@@ -507,9 +549,29 @@ pub fn frame(
     debug_assert_eq!(mid.len(), 10);
     out.extend(mid);
 
-    // --- Achievement popup (one at a time, fades out).
-    out.push(if view.achievements { popup_line(sess, t, app_t, calm) } else { Line::from("") });
+    // --- Achievement popup (one at a time, fades out), or why the orbit
+    // isn't showing.
+    let popup = if view.achievements { popup_line(sess, t, app_t, calm) } else { Line::from("") };
+    out.push(if orbit_fallback && popup.spans.is_empty() {
+        Line::from(sp(" orbit needs a bigger terminal · showing the tree", D))
+    } else {
+        popup
+    });
     finish_frame(out, sess, t, view, w)
+}
+
+/// "v  tree · orbit · timeline": the base view in the accent, the rest dim.
+fn view_switcher(view: &View) -> Vec<Span<'static>> {
+    let current = if VIEWS.iter().any(|(p, _)| *p == view.panel) { view.panel } else { view.base };
+    let mut v = vec![sp("v  ", DIM)];
+    for (i, (p, name)) in VIEWS.iter().enumerate() {
+        if i > 0 {
+            v.push(sp(" · ", DIM));
+        }
+        v.push(sp(*name, if *p == current { ac() } else { DIM }));
+    }
+    v.push(sp("  ", D));
+    v
 }
 
 /// Bottom rule (with the finish wave) and the key-hint footer.
@@ -520,10 +582,18 @@ fn finish_frame(
     view: &View,
     w: i64,
 ) -> Vec<Line<'static>> {
-    let (all, calm) = (sess.all, view.calm);
+    out.push(bottom_rule(sess, t, view, w));
 
-    // --- Bottom rule, with an accent wave that ripples across when all are
-    // done. Only touch `t - all` once all are done: while agents run `all` is
+    // --- Key hints (startup and `?`).
+    out.push(if view.footer { footer_line() } else { Line::from("") });
+
+    out
+}
+
+/// Bottom rule, with an accent wave that ripples across when all are done.
+fn bottom_rule(sess: &Session, t: i64, view: &View, w: i64) -> Line<'static> {
+    let (all, calm) = (sess.all, view.calm);
+    // Only touch `t - all` once all are done: while agents run `all` is
     // i64::MAX, and a negative live clock would overflow the subtraction.
     let mut bl = vec![sp(" ", D)];
     let wave = !calm && t >= all && t - all < 900;
@@ -534,12 +604,7 @@ fn finish_frame(
         };
         bl.push(sp(if on { "━" } else { "─" }, if on { ac() } else { D }));
     }
-    out.push(Line::from(bl));
-
-    // --- Key hints (startup and `?`).
-    out.push(if view.footer { footer_line() } else { Line::from("") });
-
-    out
+    Line::from(bl)
 }
 
 /// Up to 3 agents for the tree, as indexes into `sess.agents`. When more
@@ -920,6 +985,8 @@ fn detail_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'static
         ("done".to_string(), ac())
     } else if let Some(idle) = stats::stuck_idle(a, t, view.stuck_ms) {
         (idle_label(idle), AM)
+    } else if let Some(ms) = stats::running_long(a, t, view.stuck_ms) {
+        (running_label(ms), G)
     } else if a.wait.is_some_and(|(ws, we)| t >= ws && t < we) {
         ("waiting".to_string(), AM)
     } else {
@@ -1006,7 +1073,7 @@ fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, w: i64) -> Line<'
 }
 
 /// Truncate to `n` chars with an ellipsis.
-fn clip(s: &str, n: usize) -> String {
+pub(crate) fn clip(s: &str, n: usize) -> String {
     if clen(s) <= n {
         s.to_string()
     } else {
@@ -1014,8 +1081,25 @@ fn clip(s: &str, n: usize) -> String {
     }
 }
 
+/// "running 45s", "running 2m", "running 1h"
+pub(crate) fn running_label(ms: i64) -> String {
+    format!("running {}", short_dur(ms))
+}
+
+/// "45s", "2m", "1h"
+fn short_dur(ms: i64) -> String {
+    let s = ms / 1000;
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h", s / 3600)
+    }
+}
+
 /// "idle 45s", "idle 2m", "idle 1h"
-fn idle_label(ms: i64) -> String {
+pub(crate) fn idle_label(ms: i64) -> String {
     let s = ms / 1000;
     if s < 60 {
         format!("idle {s}s")
@@ -1179,7 +1263,7 @@ fn popup_line(sess: &Session, t: i64, app_t: i64, calm: bool) -> Line<'static> {
 
 fn footer_line() -> Line<'static> {
     let mut v = vec![sp(" ", D)];
-    let hints = [("s", "stats"), ("t", "timeline"), ("l", "lifetime"), ("?", "help")];
+    let hints = [("v", "view"), ("s", "stats"), ("t", "timeline"), ("l", "lifetime"), ("?", "help")];
     for (i, (k, what)) in hints.iter().enumerate() {
         if i > 0 {
             v.push(sp(" · ", VD));
@@ -1217,15 +1301,17 @@ mod tests {
         }
     }
 
-    /// Every panel renders exactly H lines and stays within the frame width.
+    /// Every panel renders exactly H lines (the orbit: its grid plus chrome)
+    /// and stays within the frame width.
     #[test]
     fn panels_fit_the_frame() {
         let p = crate::pricing::Pricing::default();
         let s = crate::demo::session("agentflow // demo // abcd".into(), &p);
         let totals = crate::lifetime::Totals::default();
+        let vals = vec!["test-runner".to_string(), "reviewer".to_string()];
         let mut rng = rand::thread_rng();
         for cost in [false, true] {
-            for panel in [Panel::Main, Panel::Stats, Panel::Timeline, Panel::Lifetime, Panel::Detail] {
+            for panel in [Panel::Main, Panel::Orbit, Panel::Stats, Panel::Timeline, Panel::Lifetime, Panel::Detail] {
                 for t in (0..s.length).step_by(250) {
                     let v = View {
                         calm: t % 500 == 0,
@@ -1239,9 +1325,13 @@ mod tests {
                         selected: Some((t / 250) as usize % 3),
                         // tiny threshold so sleepy rows (and their z's) get exercised
                         stuck_ms: if t % 1000 == 0 { 300 } else { 120_000 },
+                        base: if panel == Panel::Orbit { Panel::Orbit } else { Panel::Main },
+                        term: (0, 0),
+                        validators: &vals,
                     };
                     let lines = frame(&s, t, t, &v, &mut rng);
-                    assert_eq!(lines.len(), H as usize);
+                    let want = if panel == Panel::Orbit { 2 + crate::orbit::GRID_H + 3 } else { H as usize };
+                    assert_eq!(lines.len(), want, "{panel:?} t={t}");
                     for l in &lines {
                         let n = l.spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
                         assert!(n as i64 <= width(&v), "{panel:?} t={t}: {n} > {}", width(&v));
@@ -1257,10 +1347,15 @@ mod tests {
         let s = crate::demo::session("agentflow // demo // abcd".into(), &p);
         let mut rng = rand::thread_rng();
         let v = View { calm: true, cost: true, flashes: true, achievements: true, ..View::default() };
-        let mid = text(&frame(&s, 6000, 6000, &v, &mut rng));
+        let mid = text(&frame(&s, 4000, 4000, &v, &mut rng));
         assert!(mid.contains("haiku") && mid.contains("opus") && mid.contains("sonnet"), "{mid}");
+        // scout, researcher and the first test-runner start together
+        let team = text(&frame(&s, 2000, 2000, &v, &mut rng));
+        assert!(team.contains("team player ✦"), "{team}");
         assert!(mid.contains('$'), "header total / cost column");
-        assert!(mid.contains("bug hunter ✦"), "{mid}");
+        // the fixer's pytest fails at 9.5s, the test-runner's passes at 12.4s
+        let hunt = text(&frame(&s, 12_600, 12_600, &v, &mut rng));
+        assert!(hunt.contains("bug hunter ✦"), "{hunt}");
         let end = text(&frame(&s, 13_000, 13_000, &View { recap: true, ..v }, &mut rng));
         assert!(end.contains("── recap") && end.contains("mvp") && end.contains("saved $"), "{end}");
         let off = text(&frame(&s, 6000, 6000, &View { achievements: false, cost: false, ..v }, &mut rng));
@@ -1273,7 +1368,7 @@ mod tests {
         let s = crate::demo::session("h".into(), &p);
         let mut rng = rand::thread_rng();
         let v = View { calm: true, selected: Some(1), stuck_ms: 120_000, ..View::default() };
-        let lines = frame(&s, 6000, 6000, &v, &mut rng);
+        let lines = frame(&s, 4000, 4000, &v, &mut rng);
         let rows: Vec<String> = text(&lines[5..8]).lines().map(str::to_string).collect();
         assert!(rows[0].contains("· scout"), "haiku is common: {}", rows[0]);
         assert!(rows[1].starts_with('›') && rows[1].contains("✦ researcher"), "{}", rows[1]);
@@ -1330,7 +1425,7 @@ mod tests {
         assert!(txt.contains("Two ways to draw sparklines"), "result preview: {txt}");
         assert!(txt.contains("done") && txt.contains('$'));
         // still running: no result yet
-        let txt = text(&frame(&s, 6_000, 6_000, &v, &mut rng));
+        let txt = text(&frame(&s, 4_000, 4_000, &v, &mut rng));
         assert!(txt.contains("(still working…)"), "{txt}");
     }
 
@@ -1340,17 +1435,113 @@ mod tests {
         let s = crate::demo::session("h".into(), &p);
         let mut rng = rand::thread_rng();
         let v = View { calm: true, panel: Panel::Timeline, stuck_ms: 120_000, ..View::default() };
-        let txt = text(&frame(&s, 13_000, 13_000, &v, &mut rng));
-        for lane in ["◆ orchestrator", "· scout", "✦ researcher", "◆ test-runner"] {
+        let txt = text(&frame(&s, 14_000, 14_000, &v, &mut rng));
+        for lane in ["◆ orchestrator", "· scout", "✦ researcher", "◆ test-runner", "◆ reviewer", "◆ fixer", "· test-runner"] {
             assert!(txt.contains(lane), "{lane}: {txt}");
         }
-        assert!(txt.contains("0s") && txt.contains("33s"), "axis: {txt}");
+        assert!(txt.contains("0s") && txt.contains("39s"), "axis: {txt}");
         assert!(txt.contains("parallelism  peak 3 agents"), "{txt}");
         // the researcher's permission wait is drawn dim, the rest of it in the accent
-        let lines = frame(&s, 13_000, 13_000, &v, &mut rng);
+        let lines = frame(&s, 14_000, 14_000, &v, &mut rng);
         let lane = lines.iter().find(|l| text(std::slice::from_ref(l)).contains("researcher")).unwrap();
         let colors: Vec<_> = lane.spans.iter().filter(|sp| sp.content.contains(['⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿', '⡀'])).map(|sp| sp.style.fg).collect();
         assert!(colors.contains(&Some(D)) && colors.contains(&Some(ac())));
+    }
+
+    /// The orbit: header switcher with "orbit" in the accent, the ring with
+    /// the reviewer → fixer → test-runner handoff chain, both validator
+    /// verdicts, and the latest line.
+    #[test]
+    fn orbit_view_shows_the_handoff_chain_and_verdicts() {
+        let p = crate::pricing::Pricing::default();
+        let s = crate::demo::session("h".into(), &p);
+        let vals = vec!["test-runner".to_string(), "reviewer".to_string()];
+        let mut rng = rand::thread_rng();
+        let v = View { calm: true, panel: Panel::Orbit, base: Panel::Orbit, validators: &vals, ..View::default() };
+        let at = |t: i64, rng: &mut rand::rngs::ThreadRng| text(&frame(&s, t, t, &v, rng));
+
+        let lines = frame(&s, 3000, 3000, &v, &mut rng);
+        let hdr = &lines[0];
+        let orbit = hdr.spans.iter().find(|sp| sp.content == "orbit").expect("switcher");
+        assert_eq!(orbit.style.fg, Some(ac()));
+        let tree = hdr.spans.iter().find(|sp| sp.content == "tree").unwrap();
+        assert_eq!(tree.style.fg, Some(DIM));
+        let txt = text(&lines);
+        assert!(txt.contains("orchestrator") && txt.contains('◆'), "{txt}");
+        for name in ["scout", "researcher", "reviewer", "fixer", "test-runner"] {
+            assert!(txt.contains(name), "{name}: {txt}");
+        }
+        assert!(txt.contains("validator"), "idle validators say so: {txt}");
+
+        let txt = at(6000, &mut rng);
+        assert!(txt.contains("validating"), "{txt}");
+        let txt = at(8200, &mut rng);
+        assert!(txt.contains("✗ fail"), "the reviewer rejects: {txt}");
+        assert!(txt.contains("latest  reviewer → fixer") && txt.contains("findings 1.4kb"), "{txt}");
+        let txt = at(11000, &mut rng);
+        assert!(txt.contains("fixer → test-runner") && txt.contains("patch 0.9kb"), "{txt}");
+        let txt = at(13000, &mut rng);
+        assert!(txt.contains("✓ pass") && txt.contains("test-runner → orchestrator"), "{txt}");
+        assert!(txt.contains("✓ validated"), "{txt}");
+        let txt = at(14000, &mut rng);
+        assert!(txt.contains("all agents done ✓"), "{txt}");
+
+        // no validators configured: plain agents
+        let none: Vec<String> = Vec::new();
+        let plain = View { validators: &none, ..v };
+        let txt = text(&frame(&s, 13000, 13000, &plain, &mut rng));
+        assert!(!txt.contains("✓ pass") && !txt.contains("✗ fail") && txt.contains("done ✓"), "{txt}");
+    }
+
+    #[test]
+    fn orbit_falls_back_to_the_tree_in_a_small_terminal() {
+        let p = crate::pricing::Pricing::default();
+        let s = crate::demo::session("h".into(), &p);
+        let mut rng = rand::thread_rng();
+        let small = View { calm: true, panel: Panel::Orbit, base: Panel::Orbit, term: (60, 14), ..View::default() };
+        let lines = frame(&s, 7000, 7000, &small, &mut rng);
+        assert_eq!(lines.len(), H as usize);
+        let txt = text(&lines);
+        assert!(txt.contains("├─") && txt.contains("── log"), "tree: {txt}");
+        assert!(txt.contains("orbit needs a bigger terminal"), "{txt}");
+        // roomy enough: the orbit
+        let big = View { term: (100, 30), ..small };
+        let txt = text(&frame(&s, 7000, 7000, &big, &mut rng));
+        assert!(txt.contains("latest") && !txt.contains("── log"), "{txt}");
+    }
+
+    /// The stuck fix: a running agent silent for 2m+ with a tool call still in
+    /// flight reads "running 2m" with an awake face and no z's; only with
+    /// nothing in flight does it doze.
+    #[test]
+    fn in_flight_tool_call_runs_instead_of_dozing() {
+        let mut s = crate::demo::synth("h".into());
+        s.agents.truncate(1);
+        let a = &mut s.agents[0];
+        a.wait = Some((10_000, i64::MAX)); // a Bash call pending since 10s
+        a.last_seen = Some(10_000);
+        a.in_flight = Some(10_000);
+        let mut rng = rand::thread_rng();
+        let t = 10_000 + 150_000;
+        for panel in [Panel::Main, Panel::Orbit, Panel::Detail] {
+            let v = View { calm: false, stuck_ms: 120_000, panel, base: panel, selected: Some(0), ..View::default() };
+            let txt = text(&frame(&s, t, t, &v, &mut rng));
+            assert!(txt.contains("running 2m"), "{panel:?}: {txt}");
+            assert!(!txt.contains("(-_-)") && !txt.contains("idle") && !txt.contains('z'), "{panel:?}: {txt}");
+        }
+        // the slow spinner: steps every 400ms, not every 80ms
+        let v = View { calm: true, stuck_ms: 120_000, ..View::default() };
+        let spin = |t: i64, rng: &mut rand::rngs::ThreadRng| {
+            text(&frame(&s, t, t, &v, rng)).lines().nth(5).unwrap().chars().find(|c| SPIN.contains(c))
+        };
+        let t0 = t - t.rem_euclid(400);
+        assert_eq!(spin(t0, &mut rng), spin(t0 + 300, &mut rng));
+        assert_ne!(spin(t0, &mut rng), spin(t0 + 400, &mut rng));
+        // the result comes back and it stays quiet: now it dozes
+        s.agents[0].in_flight = None;
+        s.agents[0].wait = None;
+        let txt = text(&frame(&s, t, t, &v, &mut rng));
+        assert!(txt.contains("(-_-)") && txt.contains("idle 2m"), "{txt}");
     }
 
     #[test]

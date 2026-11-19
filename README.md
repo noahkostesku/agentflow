@@ -42,10 +42,45 @@ agentflow wrapped    # your month with agents, as six animated slides
 | `--no-achievements` | no achievement popups |
 | `--no-recap` | no recap card at the end |
 
-**Controls:** `q` quit · `↑`/`↓` select an agent · `Enter` agent details ·
-`Esc` back (out of a panel, then clears the selection, then quits) · `s` stats ·
-`t` timeline · `l` lifetime · `?` key hints · `c` toggle calm · `space` pause (demo) ·
-`r` restart (demo) / refresh now (live). The key hints show for ~3s on startup and on `?`.
+**Controls:** `q` quit · `v` cycle views (tree → orbit → timeline) · `↑`/`↓` select
+an agent · `Enter` agent details · `Esc` back (out of a panel, then clears the
+selection, then back to the tree, then quits) · `s` stats · `t` timeline · `l` lifetime ·
+`?` key hints · `c` toggle calm · `space` pause (demo) · `r` restart (demo) / refresh
+now (live). The key hints show for ~3s on startup and on `?`.
+
+## Views
+
+`v` cycles three views of the same session; the header shows which one is up
+(`v  tree · orbit · timeline`, the current one in mauve). Panels (`s`, `l`, the
+detail view) open over the current view, and `Esc` returns to it.
+
+- **tree**: the default. The orchestrator above a branch per agent, plus a log.
+- **orbit**: the orchestrator in the center and its agents evenly spaced on a
+  dim elliptical ring, starting at the top (up to 8; past that the busiest and the
+  selected one get the seats). Each agent shows a face, its name, a status line,
+  and a 6-cell braille trace that fills as it works. Dotted spokes carry dispatch
+  and result packets (`· • ●`) between the center and each agent, so you can see
+  who is waiting on whom. When one agent's result is fed into another agent's
+  task, a temporary dotted chord joins the two and the packet travels along it
+  instead (see *handoffs* below). The bottom line shows the latest dispatch,
+  handoff, or result, e.g. `reviewer → fixer  findings 1.4kb`. It needs about
+  25 rows; in a smaller terminal it falls back to the tree and says so.
+  `↑`/`↓` and `Enter` work here too.
+- **timeline**: swimlanes across the whole session (also on `t`; see below).
+
+**Handoffs** are detected, not guessed: a finished agent's result (or its agent
+id) has to show up in a later `Agent` call's prompt, either whole or in at least
+two distinctive lines (or one long one). For agent teams, a teammate's direct
+`SendMessage` to another teammate draws a chord too.
+
+**Validators** (optional) are roles you name in the config, e.g.
+`validators = ["test-runner", "reviewer"]`. In the orbit, a validator idles as
+`validator`, shows `validating ⠹` while it works, then `✓ pass` or `✗ fail` (soft
+red): an explicit `Verdict: …` line in its result wins, then the exit status of
+its last test command, then its result's wording (`LGTM`, `changes requested`, …).
+This is display only. agentflow just reads transcripts, so naming a validator
+changes how it's drawn and gates nothing in Claude Code. None are set by default;
+`--demo` shows the two above so you can see what they look like.
 
 ## Agents up close
 
@@ -67,8 +102,10 @@ first lines of its final result. `Esc` goes back.
 **Stuck alert** — a running agent whose transcript has gone quiet for 2+ minutes
 dozes off: `(-_-)` with a slow `z z z` drifting up into the row above, and
 `idle 2m` in amber. Any new transcript entry wakes it. Set the threshold with
-`stuck_after` (seconds; `0` turns it off). A single long-running command (a slow
-build) also writes nothing until it returns, so it can doze too.
+`stuck_after` (seconds; `0` turns it off). An agent with a tool call still in
+flight (a slow build or test run: a `tool_use` with no `tool_result` yet) isn't
+stuck: it stays awake and reads `running 2m` with a slow spinner. It only dozes
+when nothing is in flight.
 
 ## Cost, stats & achievements
 
@@ -130,6 +167,7 @@ flashes = true        # "+$0.02" flash per call
 persistence = true    # lifetime totals for the `l` view and `wrapped`
 accent = "#c4a5b4"    # the one accent color (dusty mauve)
 stuck_after = 120     # seconds of silence before an agent dozes (0 = off)
+validators = ["test-runner", "reviewer"]  # optional: pass/fail labels in the orbit (default: none)
 
 [pricing.opus]        # USD per million tokens; key by family or exact model id
 input = 4.0           # unset fields keep the built-in rate

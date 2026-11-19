@@ -1,76 +1,103 @@
-//! The scripted demo session — a direct port of the `A` array and `EV`
-//! derivation in agentflow-mockup.html. Replays on a loop.
+//! The scripted demo session: the agentflow mockup's tree flow plus the orbit
+//! mockup's (docs/agentflow-orbit-mockup.html) handoff chain. Replays on a loop.
+//!
+//! scout, researcher and a test-runner start in parallel (team player): the
+//! test-runner (a validator) finds a failing parser test. Then the reviewer
+//! (a validator) rejects the parser change; its findings are handed to the
+//! fixer, whose patch is handed to a second test-runner, which passes it.
 
 use crate::model::{Agent, Call, Event, Session, TestRun, Tool, Use, Usage};
 use crate::pricing::{self, Pricing};
 use crate::theme;
 
-/// Build the demo session (same timeline, faces, sizes, and log as the mockup).
-/// `header` is the full header string, derived from the real watched directory.
+/// Validator roles the demo shows when the config names none, so the
+/// pass/fail gates are on display.
+pub const VALIDATORS: [&str; 2] = ["test-runner", "reviewer"];
+
+/// Loop length: everything is done by 13.3s, the recap shows at 14.8s; the
+/// rest leaves room for demo.tape to tour the views before it wraps.
+const LENGTH: i64 = 20_000;
+
+/// Build the demo session. `header` is the full header string, derived from
+/// the real watched directory.
 pub fn session(header: String, pricing: &Pricing) -> Session {
-    let agents = vec![
+    let mut agents = vec![
         Agent {
             name: "scout".into(),
-            spawn: 1000,
-            finish: Some(9300),
-            wait: None,
+            spawn: 800,
+            finish: Some(4000),
             tools: vec![Tool::look("read"), Tool::look("grep"), Tool::look("glob")],
-            live_tool: None,
             size: "2.1kb".into(),
             bob: 0,
-            error: false,
-            error_at: None,
             ..Agent::default()
         },
         Agent {
             name: "researcher".into(),
-            spawn: 1800,
-            finish: Some(10800),
-            wait: Some((5600, 7300)),
-            tools: vec![
-                Tool::run("web_fetch"),
-                Tool::look("read"),
-                Tool::run("web_search"),
-            ],
-            live_tool: None,
+            spawn: 1200,
+            finish: Some(5000),
+            wait: Some((2900, 3700)),
+            tools: vec![Tool::run("web_fetch"), Tool::look("read"), Tool::run("web_search")],
             size: "4.8kb".into(),
             bob: 3,
-            error: false,
-            error_at: None,
             ..Agent::default()
         },
         Agent {
             name: "test-runner".into(),
-            spawn: 2600,
-            finish: Some(7600),
-            wait: None,
-            tools: vec![Tool::run("bash"), Tool::run("pytest"), Tool::look("read")],
-            live_tool: None,
-            size: "1.2kb".into(),
+            spawn: 1600,
+            finish: Some(4600),
+            tools: vec![Tool::run("pytest"), Tool::look("read")],
+            size: "0.4kb".into(),
+            bob: 8,
+            ..Agent::default()
+        },
+        Agent {
+            name: "reviewer".into(),
+            spawn: 5200,
+            finish: Some(7400),
+            tools: vec![Tool::look("read"), Tool::look("grep")],
+            size: "1.4kb".into(),
             bob: 6,
-            error: false,
-            error_at: None,
+            ..Agent::default()
+        },
+        Agent {
+            name: "fixer".into(),
+            spawn: 8000,
+            finish: Some(10200),
+            tools: vec![Tool::run("pytest"), Tool::run("edit")],
+            size: "0.9kb".into(),
+            bob: 2,
+            ..Agent::default()
+        },
+        Agent {
+            name: "test-runner".into(),
+            spawn: 10800,
+            finish: Some(12800),
+            tools: vec![Tool::run("pytest"), Tool::look("read")],
+            size: "0.6kb".into(),
+            bob: 5,
             ..Agent::default()
         },
     ];
-    let mut agents = agents;
     script_activity(&mut agents, pricing);
+    // Found the same way as live: each result quoted in the next agent's prompt.
+    let handoffs = crate::orbit::detect_handoffs(&agents);
 
     let all = agents.iter().filter_map(|a| a.finish).max().unwrap_or(0) + 500;
-    let events = build_events(&agents, all);
+    let events = build_events(&agents, &handoffs, all);
 
     Session {
         header,
         agents,
         events,
         all,
-        length: 14500,
+        length: LENGTH,
         live: false,
         orch_model: "opus".into(),
-        orch_calls: [0, 1000, 1800, 2600, 11300]
+        orch_calls: [0, 800, 1200, 1600, 5200, 8000, 10800, 13000]
             .iter()
             .map(|&t| call(t, "claude-opus-5-5", 40, 260, 21_000, 900, pricing))
             .collect(),
+        handoffs,
         ..Session::default()
     }
 }
@@ -80,19 +107,58 @@ fn call(time: i64, model: &str, input: u64, output: u64, read: u64, write: u64, 
     Call { time, usage, cost: p.cost(model, &usage), saved: p.cache_savings(model, &usage) }
 }
 
-/// Scripted model calls, file touches, and one red→green test run, lined up
-/// with each agent's tool cycle (a tool every 1.6s after it boots). Shows off
-/// costs, the stats panel, and three achievements: team player (3 at once),
-/// bug hunter (pytest fails, then passes), pacifist (scout makes no edits).
+const MODELS: [&str; 6] = [
+    "claude-haiku-5-5",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-sonnet-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+];
+
+/// The real tool name, its short argument, and the file it touches, for a
+/// row's friendly tool label.
+fn use_of(tool: &str, f: &'static str) -> (&'static str, &'static str, Option<&'static str>, bool) {
+    match tool {
+        "read" => ("read", f.rsplit('/').next().unwrap_or(f), Some(f), false),
+        "grep" => ("grep", "fn parse_header", None, false),
+        "glob" => ("glob", "src/**/*.rs", None, false),
+        "web_fetch" => ("webfetch", "docs.rs", None, false),
+        "web_search" => ("websearch", "braille sparkline tui", None, false),
+        "pytest" => ("bash", "pytest tests/ -q", None, false),
+        "edit" => ("edit", f.rsplit('/').next().unwrap_or(f), Some(f), true),
+        _ => ("bash", "", None, false),
+    }
+}
+
+/// One tool call plus the model call that decided on it, a beat before.
+fn add_use(a: &mut Agent, i: usize, time: i64, tool: &str, f: &'static str, k: u64, p: &Pricing) {
+    let (name, arg, file, edit) = use_of(tool, f);
+    a.uses.push(Use { time, tool: name.into(), file: file.map(str::to_string), edit, arg: arg.into() });
+    let (o, r, w) = match i {
+        0 | 5 => (180 + 40 * k, 14_000, 1_200),
+        1 => (900 + 150 * k, 30_000, 6_000),
+        _ => (420 + 60 * k, 18_000, 2_400),
+    };
+    a.calls.push(call(time - 300, MODELS[i], 20, o, r, w, p));
+}
+
+/// Scripted model calls, file touches, and a red→green test run, lined up
+/// with each agent's tool cycle (a tool every 1.6s after it boots) plus a few
+/// extra steps. Shows off costs, the stats panel, achievements (team player:
+/// three at once; speedrun; pacifist; bug hunter: the first test-runner sees
+/// the failure, the second sees it pass), handoffs, and both validator verdicts.
 fn script_activity(agents: &mut [Agent], p: &Pricing) {
-    let models = ["claude-haiku-5-5", "claude-opus-5-5", "claude-sonnet-5-5"];
-    let files: [&[&str]; 3] = [
+    let files: [&[&'static str]; 6] = [
         &["src/render.rs", "src/model.rs", "src/render.rs", "README.md"],
         &["docs/api.md", "src/render.rs"],
-        &["tests/test_parser.py", "src/parser.py"],
+        &["tests/test_parser.py"],
+        &["src/parser.py", "tests/test_parser.py"],
+        &["src/parser.py"],
+        &["tests/test_parser.py"],
     ];
     for (i, a) in agents.iter_mut().enumerate() {
-        a.model = pricing::family(models[i]);
+        a.model = pricing::family(MODELS[i]);
         let act = a.spawn + 1300;
         let finish = a.finish.unwrap_or(act);
         let mut k = 0i64;
@@ -100,59 +166,43 @@ fn script_activity(agents: &mut [Agent], p: &Pricing) {
         while tt < finish {
             let in_wait = a.wait.is_some_and(|(s, e)| tt >= s && tt < e);
             if !in_wait {
-                let tool = &a.tools[(k as usize) % a.tools.len()];
+                let tool = a.tools[(k as usize) % a.tools.len()].name.clone();
                 let f = files[i][(k as usize) % files[i].len()];
-                // the row shows a friendly label; stats and the detail view
-                // get the real tool name and its argument
-                let (name, arg, file) = match tool.name.as_str() {
-                    "read" => ("read", f.rsplit('/').next().unwrap_or(f), Some(f)),
-                    "grep" => ("grep", "fn frame", None),
-                    "glob" => ("glob", "src/**/*.rs", None),
-                    "web_fetch" => ("webfetch", "docs.rs", None),
-                    "web_search" => ("websearch", "braille sparkline tui", None),
-                    "pytest" => ("bash", "pytest tests/ -q", None),
-                    "bash" => ("bash", "pytest -x", None),
-                    other => (other, "", None),
-                };
-                a.uses.push(Use {
-                    time: tt,
-                    tool: name.into(),
-                    file: file.map(str::to_string),
-                    edit: false,
-                    arg: arg.into(),
-                });
-                // the call that decided on this tool, a beat before it
-                let (o, r, w) = match i {
-                    0 => (180 + 40 * k as u64, 14_000, 1_200),
-                    1 => (900 + 150 * k as u64, 30_000, 6_000),
-                    _ => (420 + 60 * k as u64, 18_000, 2_400),
-                };
-                a.calls.push(call(tt - 300, models[i], 20, o, r, w, p));
+                add_use(a, i, tt, &tool, f, k as u64, p);
             }
             k += 1;
             tt = act + k * 1600;
         }
         // the final answer
-        a.calls.push(call(finish - 200, models[i], 20, 600, 16_000, 800, p));
+        a.calls.push(call(finish - 200, MODELS[i], 20, 600, 16_000, 800, p));
     }
-    // test-runner: `bash` runs pytest red, a quick fix, then pytest goes green
-    let tr = &mut agents[2];
-    tr.tests = vec![
-        TestRun { time: tr.spawn + 1300, passed: false },
-        TestRun { time: tr.spawn + 2900, passed: true },
-    ];
-    tr.uses.push(Use {
-        time: tr.spawn + 2200,
-        tool: "edit".into(),
-        file: Some("src/parser.py".into()),
-        edit: true,
-        arg: "parser.py".into(),
-    });
-    tr.uses.sort_by_key(|u| u.time);
+    // a few more steps than the tool cycle has room for
+    add_use(&mut agents[3], 3, 7000, "grep", "", 1, p);
+    add_use(&mut agents[4], 4, 8700, "read", "src/parser.py", 1, p);
+    add_use(&mut agents[4], 4, 9700, "edit", "src/parser.py", 2, p);
+    add_use(&mut agents[5], 5, 11500, "read", "tests/test_parser.py", 1, p);
+    // the first test-runner's pytest (2.9s) fails, the fixer's (9.3s)
+    // reproduces it, the second test-runner's (12.1s) comes back green
+    agents[2].tests = vec![TestRun { time: 3100, passed: false }];
+    agents[4].tests = vec![TestRun { time: 9500, passed: false }];
+    agents[5].tests = vec![TestRun { time: 12400, passed: true }];
+    for a in agents.iter_mut() {
+        a.uses.sort_by_key(|u| u.time);
+        a.calls.sort_by_key(|c| c.time);
+    }
 
-    let story: [(&str, &str); 3] = [
+    let review = "Verdict: changes requested\n\
+         1 blocking issue in src/parser.py:\n\
+         - parse_header() splits on every ':' so header values with a colon get cut off\n\
+         - tests/test_parser.py has no case for a value like 'Host: a:b'\n\
+         Suggested fix: split(':', 1) plus a regression test.";
+    let patch = "Patched parse_header() in src/parser.py to split(':', 1)\n\
+         Added test_header_value_with_colon to tests/test_parser.py\n\
+         pytest -x reproduced the failure before the fix.";
+    let story: [(&str, String, &str); 6] = [
         (
             "map the render pipeline",
+            "Map the render pipeline: which files build a frame, and in what order.".into(),
             "Render pipeline, top to bottom:\n\
              - src/render.rs  frame() builds every line\n\
              - row() draws one agent: branch, face, bar\n\
@@ -167,6 +217,7 @@ fn script_activity(agents: &mut [Agent], p: &Pricing) {
         ),
         (
             "compare braille sparkline approaches",
+            "Compare braille vs block-element sparklines for a terminal UI.".into(),
             "Two ways to draw sparklines in a terminal:\n\
              1. block elements ▁▂▃▄▅▆▇█: 8 levels, 1 col each\n\
              2. braille ⣀⣤⣶⣿: 4 levels per row, 2 cols per cell\n\
@@ -176,15 +227,32 @@ fn script_activity(agents: &mut [Agent], p: &Pricing) {
              braille for the files heatmap.",
         ),
         (
-            "run parser tests and fix failures",
-            "pytest: 1 failed → fixed → 14 passed\n\
-             Cause: parse_header() split on ':' once too often.\n\
-             Fix: src/parser.py, split(':', 1).\n\
-             All parser tests green.",
+            "run the parser tests",
+            "Run the parser tests and report pass or fail.".into(),
+            "pytest tests/ -q: 1 failed, 13 passed\n\
+             FAILED tests/test_parser.py::test_parse_header\n\
+             Verdict: fail",
+        ),
+        (
+            "review the parser change",
+            "Review the parser change in src/parser.py and its tests. End with a verdict.".into(),
+            review,
+        ),
+        (
+            "fix the review findings",
+            format!("Fix the blocking issue from this review, then run the tests.\n\n{review}"),
+            patch,
+        ),
+        (
+            "validate the patch",
+            format!("Validate this patch: run the full test suite and report pass or fail.\n\n{patch}"),
+            "pytest tests/ -q: 15 passed, 0 failed\n\
+             Verdict: pass",
         ),
     ];
-    for (a, (task, result)) in agents.iter_mut().zip(story) {
+    for (a, (task, prompt, result)) in agents.iter_mut().zip(story) {
         a.task = task.into();
+        a.prompt = prompt;
         a.result = Some(result.into());
     }
 }
@@ -244,9 +312,17 @@ pub fn synth(header: String) -> Session {
     }
 }
 
-/// Port of the mockup's `EV` construction, then sorted by time.
-fn build_events(agents: &[Agent], all: i64) -> Vec<Event> {
+/// Port of the mockup's `EV` construction, plus handoffs, sorted by time.
+fn build_events(agents: &[Agent], handoffs: &[crate::model::Handoff], all: i64) -> Vec<Event> {
     let mut ev: Vec<Event> = Vec::new();
+    for h in handoffs {
+        ev.push(Event {
+            time: h.time,
+            label: format!("{} \u{2192} {}", agents[h.from].name, agents[h.to].name),
+            detail: format!("{} {}", h.what, h.size),
+            color: theme::B,
+        });
+    }
     for a in agents {
         let finish = a.finish.unwrap_or(0);
         let act = a.spawn + 1300;

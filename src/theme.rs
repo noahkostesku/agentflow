@@ -1,6 +1,7 @@
 //! Color palette. Terminal background only; one muted accent (dusty mauve by
-//! default, configurable); amber = waiting; red = error. A four-step grayscale
-//! ramp plus the accent and two tints derived from it.
+//! default, configurable); soft amber = waiting; soft red = error. A grayscale
+//! ramp plus the accent and tints derived from it. One palette (the site's,
+//! see docs/agentflow-orbit-mockup.html) for every view.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -16,10 +17,16 @@ pub const G: Color = Color::Rgb(0xb3, 0xb3, 0xb3);
 pub const D: Color = Color::Rgb(0x73, 0x73, 0x73);
 /// deep dim #2a2a2a — placeholders / empty progress cells
 pub const VD: Color = Color::Rgb(0x2a, 0x2a, 0x2a);
-/// amber #ffb000 — waiting (blocked on a call that hasn't returned)
-pub const AM: Color = Color::Rgb(0xff, 0xb0, 0x00);
-/// red #ff4d6d — error
-pub const RED: Color = Color::Rgb(0xff, 0x4d, 0x6d);
+/// soft amber #d4b483 — waiting (blocked on a call that hasn't returned), dozing
+pub const AM: Color = Color::Rgb(0xd4, 0xb4, 0x83);
+/// soft red #d48a8a — errors, a validator's fail
+pub const RED: Color = Color::Rgb(0xd4, 0x8a, 0x8a);
+
+// Orbit view (docs/agentflow-orbit-mockup.html palette).
+/// ring #262626 — the orbit ring's dots
+pub const RING: Color = Color::Rgb(0x26, 0x26, 0x26);
+/// dim #3a3a3a — spokes, faded chords, idle agents
+pub const DIM: Color = Color::Rgb(0x3a, 0x3a, 0x3a);
 
 static ACCENT: AtomicU32 = AtomicU32::new(DEFAULT_ACCENT);
 
@@ -46,6 +53,17 @@ pub fn wh() -> Color {
     }
     let (r, g, b) = rgb(a);
     let t = |c: u8| (c as f64 + (255.0 - c as f64) * 0.77).round() as u8;
+    Color::Rgb(t(r), t(g), t(b))
+}
+
+/// light mauve — a name's arrival flash in the orbit (accent ~70% to white)
+pub fn light() -> Color {
+    let a = ACCENT.load(Ordering::Relaxed);
+    if a == DEFAULT_ACCENT {
+        return Color::Rgb(0xef, 0xe2, 0xe9);
+    }
+    let (r, g, b) = rgb(a);
+    let t = |c: u8| (c as f64 + (255.0 - c as f64) * 0.7).round() as u8;
     Color::Rgb(t(r), t(g), t(b))
 }
 

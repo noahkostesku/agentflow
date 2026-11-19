@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span};
 
 use crate::lifetime::Totals;
 use crate::model::{rarity, Agent, Session, Tool, ToolKind};
-use crate::pricing::{fmt_cost, fmt_delta, fmt_tokens};
+use crate::pricing::{approx_cost, fmt_cost, fmt_delta, fmt_tokens};
 use crate::stats;
 use crate::theme::*;
 
@@ -133,8 +133,27 @@ fn cfrom(s: &str, start: usize) -> String {
 /// Session clock as "HH:MM:SS", offset by 161s like the mockup. The demo stays
 /// under an hour so it reads "00:MM:SS"; live sessions can run longer.
 fn clk(ms: i64) -> String {
-    let s = 161 + ms / 1000;
+    let s = (ms / 1000).max(0);
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+}
+
+/// Fit "a // b // c" into `room` columns by shortening its longest part with
+/// "…" (the project name: "agentflow-playground" → "agentflow-pl…").
+fn fit_title(title: &str, room: usize) -> String {
+    if clen(title) <= room {
+        return title.to_string();
+    }
+    let mut parts: Vec<String> = title.split(" // ").map(str::to_string).collect();
+    let longest = (0..parts.len()).max_by_key(|&i| clen(&parts[i])).unwrap_or(0);
+    let over = clen(title) - room;
+    let keep = clen(&parts[longest]).saturating_sub(over + 1).max(1);
+    parts[longest] = format!("{}…", ctake(&parts[longest], keep));
+    let out = parts.join(" // ");
+    if clen(&out) <= room {
+        out
+    } else {
+        ctake(&out, room)
+    }
 }
 
 /// Glitch a string: ~22% of chars become a random shade block. No-op when calm.
@@ -435,7 +454,14 @@ pub fn frame(
 
     // --- Header: title types in with a blinking cursor; "linking… ok" then
     // clock, with the running session cost in front of it.
-    let ttl = &sess.header;
+    // The title gets the room the right side leaves once it's all up (view
+    // keys, cost, clock), so it never runs into them; a long project name is
+    // shortened with "…".
+    let steady = clen(&clk(t))
+        + if view.cost { clen(&approx_cost(sess.cost_at(t))) + 4 } else { 0 }
+        + view_switcher(view).iter().map(|s| clen(&s.content)).sum::<usize>();
+    let fitted = fit_title(&sess.header, (w as usize).saturating_sub(steady + 3));
+    let ttl = &fitted;
     let shown = ctake(ttl, (app_t / 16).max(0) as usize);
     let cur = if clen(&shown) < clen(ttl) && (app_t / 120) % 2 != 0 {
         "█"
@@ -452,7 +478,9 @@ pub fn frame(
     } else {
         clk(t)
     };
-    let total = (view.cost && !linking).then(|| format!("{} · ", fmt_cost(sess.cost_at(t))));
+    // "?": some tokens were billed by a model with no known price ($0)
+    let unpriced = if sess.unpriced.is_empty() { "" } else { "?" };
+    let total = (view.cost && !linking).then(|| format!("{}{unpriced} · ", approx_cost(sess.cost_at(t))));
     let lt = format!(" {}{}", shown, cur);
     // View switcher "v  tree · orbit · timeline", the current one in the accent.
     let switcher = (!linking).then(|| view_switcher(view));
@@ -523,7 +551,7 @@ pub fn frame(
 
     let mut o = vec![
         sp(" ◆ ", ac()),
-        sp("orchestrator ", B),
+        sp(pad(sess.root_name(), 13), B),
         sp(pad(&sess.orch_model, BADGE as usize), D),
         sp(pad(of, 8), if t >= all || fl.is_some() { ac() } else { G }),
         sp(pad(&os, 14), if t >= all { ac() } else { G }),
@@ -729,7 +757,7 @@ fn recap_lines(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'static>
     let mut out = vec![rule("recap", "any key to dismiss", w)];
     let tokens = format!("{} tokens", fmt_tokens(r.tokens));
     out.push(if view.cost {
-        kv("total", fmt_cost(r.cost), tokens)
+        kv("total", approx_cost(r.cost), tokens)
     } else {
         kv("total", tokens, String::new())
     });
@@ -763,11 +791,19 @@ fn stats_panel(
     for c in sess.all_calls_at(t) {
         u.add(&c.usage);
     }
-    let hit = if u.total() == 0 {
+    let mut hit = if u.total() == 0 {
         String::new()
     } else {
         format!("cache hit {:.0}%", stats::hit_rate(&u) * 100.0)
     };
+    if view.cost {
+        // what the tokens would cost on the pay-per-token API, not a bill
+        let sep = if hit.is_empty() { "" } else { " · " };
+        hit = format!("api-equivalent cost{sep}{hit}");
+        if !sess.unpriced.is_empty() {
+            hit = format!("{hit} · no price: {} ($0)", sess.unpriced.join(", "));
+        }
+    }
     let mut out = vec![rule("stats", &hit, w)];
 
     // 3 agent lines
@@ -923,7 +959,7 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'stat
     };
 
     // orchestrator lane: alive across the whole axis
-    let mut l = vec![sp(" ◆ ", ac()), sp(pad("orchestrator", LABEL - 3), B)];
+    let mut l = vec![sp(" ◆ ", ac()), sp(pad(sess.root_name(), LABEL - 3), B)];
     for n in &orch {
         l.push(sp(level(*n).to_string(), ac()));
     }
@@ -1257,7 +1293,7 @@ fn lifetime_panel(view: &View, w: i64) -> Vec<Line<'static>> {
     };
     out.push(kv("sessions", lt.sessions.to_string(), "agents", lt.agents.to_string()));
     out.push(if view.cost {
-        kv("spent", fmt_cost(lt.cost), "tokens", fmt_tokens(lt.tokens))
+        kv("api cost", approx_cost(lt.cost), "tokens", fmt_tokens(lt.tokens))
     } else {
         kv("tokens", fmt_tokens(lt.tokens), "", String::new())
     });
@@ -1329,6 +1365,48 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n")
             .collect()
+    }
+
+    /// A long project name is shortened with "…" so the title never runs
+    /// into the view keys, cost and clock on the right.
+    #[test]
+    fn long_titles_shorten_instead_of_colliding() {
+        assert_eq!(fit_title("agentflow // codex // demo", 40), "agentflow // codex // demo");
+        let t = fit_title("agentflow // codex // agentflow-playground", 34);
+        assert_eq!(t, "agentflow // codex // agentflow-p…");
+        assert!(clen(&fit_title("agentflow // a-very-long-project-name-indeed // 1a2b", 30)) <= 30);
+
+        let p = crate::pricing::Pricing::default();
+        let mut s = crate::demo::session("agentflow // codex // a-really-quite-long-project-directory-name".into(), &p);
+        s.length = 1;
+        let v = View { calm: true, cost: true, ..View::default() };
+        let header = text(&frame(&s, 9_000, 9_000, &v, &mut rand::thread_rng())).lines().next().unwrap().to_string();
+        assert!(header.contains("…") && header.contains("v  tree"), "{header}");
+        assert!(clen(&header) <= width(&v) as usize, "{header}");
+    }
+
+    /// Clock times are real elapsed time (the mockup's 00:02:41 start is gone).
+    #[test]
+    fn clock_starts_at_zero() {
+        assert_eq!(clk(0), "00:00:00");
+        assert_eq!(clk(61_500), "00:01:01");
+        assert_eq!(clk(-500), "00:00:00");
+    }
+
+    /// One agent working for the user: the root reads "you", not orchestrator.
+    #[test]
+    fn solo_sessions_root_is_you() {
+        let p = crate::pricing::Pricing::default();
+        let mut s = crate::demo::session("h".into(), &p);
+        let v = View { calm: true, ..View::default() };
+        let mut rng = rand::thread_rng();
+        assert!(text(&frame(&s, 9_000, 9_000, &v, &mut rng)).contains("orchestrator"));
+        s.solo = true;
+        s.events.clear(); // the demo's scripted log names its orchestrator
+        for panel in [Panel::Main, Panel::Orbit, Panel::Timeline] {
+            let txt = text(&frame(&s, 9_000, 9_000, &View { panel, ..v }, &mut rng));
+            assert!(txt.contains("you") && !txt.contains("orchestrator"), "{panel:?}: {txt}");
+        }
     }
 
     /// Live clock can read slightly negative (transcript timestamps ahead of the

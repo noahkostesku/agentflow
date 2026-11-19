@@ -334,11 +334,14 @@ fn slide_spend(w: &Wrapped, ms: i64) -> Vec<Line<'static>> {
             sp(b, c),
         ])
     };
+    // Subscriptions aren't billed per token: this is what the usage would
+    // cost at pay-per-token API rates, not the bill.
+    let headline = format!("≈{} of API usage {}", money(w.cost), w.range.label());
     vec![
-        Line::from(sp(center(&typed("what it cost", ms, 0)), G)),
+        Line::from(sp(center(&typed(&headline, ms, 0)), G)),
         blank(),
         blank(),
-        row("spent", money(spent), bar(w.cost, 400), ac()),
+        row("api use", money(spent), bar(w.cost, 400), ac()),
         blank(),
         row("saved", money(saved), bar(w.saved, 900), dim(ac(), 0.6)),
         blank(),
@@ -346,6 +349,7 @@ fn slide_spend(w: &Wrapped, ms: i64) -> Vec<Line<'static>> {
             center(&typed(&format!("{} tokens processed", fmt_tokens(w.tokens)), ms, 1700)),
             D,
         )),
+        Line::from(sp(center(&typed("at pay-per-token API rates, not your bill", ms, 2200)), VD)),
     ]
 }
 
@@ -529,7 +533,12 @@ pub fn outro_rows(w: &Wrapped) -> Vec<Vec<(String, Color)>> {
         vec![("agentflow wrapped".into(), ac()), (format!(" · {}", w.range.label()), D)],
         vec![],
         vec![(w.agents.to_string(), B), (" agents · ".into(), D), (w.sessions.to_string(), B), (" sessions".into(), D)],
-        vec![(money(w.cost), B), (" spent · ".into(), D), (money(w.saved), B), (" saved by cache".into(), D)],
+        vec![
+            (format!("≈{}", money(w.cost)), B),
+            (" api usage · ".into(), D),
+            (money(w.saved), B),
+            (" saved by cache".into(), D),
+        ],
         top_row,
         vec![("busiest hour ".into(), D), (hour, B)],
         time_row,

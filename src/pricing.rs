@@ -2,18 +2,28 @@
 //! rates.** Per-model rates can also be overridden without rebuilding via
 //! `[pricing.<model-or-family>]` in `~/.agentflow/config.toml`.
 //!
-//! Rates are Anthropic first-party API list prices (as of 2026-11). Cache
-//! writes are 1.25× input for the 5-minute TTL and 2× for the 1-hour TTL.
+//! Every entry is a first-party, standard-tier API list price, with the date
+//! it was last checked against the provider's own page:
+//!   * Anthropic: <https://platform.claude.com/docs/en/about-claude/pricing>
+//!   * OpenAI: <https://developers.openai.com/api/docs/pricing>
+//!
 //! Lookup tries the exact model id first, then falls back to the family's
-//! current-generation rates (so a new point release still gets a sane price).
-//! Costs are estimates: they ignore batch/priority discounts, fast mode, and
-//! subscription plans.
+//! current-generation rates (Claude only, so a new point release still gets
+//! a sane price). Unknown models cost $0 and are flagged in the UI.
+//!
+//! Costs are **API-equivalent estimates**: what the tokens would cost on the
+//! pay-per-token API. Subscription plans (Claude plans, ChatGPT for Codex)
+//! aren't billed per token. Batch/flex discounts, fast mode, data-residency
+//! multipliers and long-prompt tiers (Haiku 5.5 prompts over 100K tokens,
+//! gpt-6 prompts over 272K) are not modeled.
 
 use std::collections::HashMap;
 
 use crate::model::Usage;
 
-/// USD per million tokens.
+/// USD per million tokens. The two cache-write rates are the provider's
+/// short and long TTLs: Anthropic's 5-minute / 1-hour, OpenAI's 30-minute /
+/// 12-hour.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rates {
     pub input: f64,
@@ -23,6 +33,8 @@ pub struct Rates {
     pub cache_write_1h: f64,
 }
 
+/// Rates with Anthropic's cache-write multiples: 1.25× input for the short
+/// TTL, 2× for the long.
 const fn r(input: f64, output: f64, cache_read: f64) -> Rates {
     Rates {
         input,
@@ -33,25 +45,40 @@ const fn r(input: f64, output: f64, cache_read: f64) -> Rates {
     }
 }
 
-/// Exact model ids → rates.
-const MODELS: &[(&str, Rates)] = &[
-    ("claude-fable-5-2", r(8.0, 40.0, 0.20)),
-    ("claude-mythos-5-2", r(8.0, 40.0, 0.20)),
-    ("claude-fable-5-1", r(10.0, 50.0, 0.25)),
-    ("claude-mythos-5-1", r(10.0, 50.0, 0.25)),
-    ("claude-fable-5", r(10.0, 50.0, 1.00)),
-    ("claude-mythos-5", r(10.0, 50.0, 1.00)),
-    ("claude-opus-5-5", r(4.0, 20.0, 0.20)),
-    ("claude-opus-5", r(5.0, 25.0, 0.50)),
-    ("claude-opus-4-8", r(5.0, 25.0, 0.50)),
-    ("claude-opus-4-7", r(5.0, 25.0, 0.50)),
-    ("claude-opus-4-6", r(5.0, 25.0, 0.50)),
-    ("claude-sonnet-5-5", r(2.0, 10.0, 0.10)),
-    ("claude-sonnet-5", r(2.0, 10.0, 0.20)),
-    ("claude-sonnet-4-6", r(3.0, 15.0, 0.30)),
-    // Haiku 5.5's cache-read rate isn't published in our reference; 0.1× input assumed.
-    ("claude-haiku-5-5", r(0.10, 0.50, 0.01)),
-    ("claude-haiku-4-5", r(1.0, 5.0, 0.10)),
+/// Rates with every field given (OpenAI: 30-minute / 12-hour writes).
+const fn full(input: f64, output: f64, cache_read: f64, write_short: f64, write_long: f64) -> Rates {
+    Rates { input, output, cache_read, cache_write_5m: write_short, cache_write_1h: write_long }
+}
+
+/// Exact model ids → rates, and when they were last verified on the
+/// provider's pricing page (YYYY-MM-DD).
+const MODELS: &[(&str, Rates, &str)] = &[
+    // Anthropic
+    ("claude-fable-5-2", r(8.0, 40.0, 0.20), "2026-11-19"),
+    ("claude-mythos-5-2", r(8.0, 40.0, 0.20), "2026-11-19"),
+    ("claude-fable-5-1", r(10.0, 50.0, 0.25), "2026-11-19"),
+    ("claude-mythos-5-1", r(10.0, 50.0, 0.25), "2026-11-19"),
+    ("claude-fable-5", r(10.0, 50.0, 1.00), "2026-11-19"),
+    ("claude-mythos-5", r(10.0, 50.0, 1.00), "2026-11-19"),
+    ("claude-opus-5-5", r(4.0, 20.0, 0.20), "2026-11-19"),
+    ("claude-opus-5", r(5.0, 25.0, 0.50), "2026-11-19"),
+    ("claude-opus-4-8", r(5.0, 25.0, 0.50), "2026-11-19"),
+    ("claude-opus-4-7", r(5.0, 25.0, 0.50), "2026-11-19"),
+    ("claude-opus-4-6", r(5.0, 25.0, 0.50), "2026-11-19"),
+    ("claude-sonnet-5-5", r(2.0, 10.0, 0.10), "2026-11-19"),
+    ("claude-sonnet-5", r(2.0, 10.0, 0.20), "2026-11-19"),
+    ("claude-sonnet-4-6", r(3.0, 15.0, 0.30), "2026-11-19"),
+    // prompts up to 100K tokens (the over-100K tier isn't modeled)
+    ("claude-haiku-5-5", r(0.10, 0.50, 0.01), "2026-11-19"),
+    ("claude-haiku-4-5", r(1.0, 5.0, 0.10), "2026-11-19"),
+    // OpenAI (Codex), short-context standard tier
+    ("gpt-6-luna", full(0.10, 0.50, 0.01, 0.125, 0.25), "2026-11-19"),
+    ("gpt-6-sol", full(2.0, 10.0, 0.20, 2.50, 5.0), "2026-11-19"),
+    ("gpt-6-astra", full(10.0, 50.0, 1.00, 12.50, 25.0), "2026-11-19"),
+    ("gpt-6.1-sol", full(2.0, 10.0, 0.10, 2.50, 5.0), "2026-11-19"),
+    ("gpt-6.1-terra", full(1.0, 5.0, 0.05, 1.25, 2.50), "2026-11-19"),
+    ("gpt-6.2-astra", full(8.0, 40.0, 0.40, 10.0, 20.0), "2026-11-19"),
+    ("gpt-6.2-sol", full(2.0, 10.0, 0.10, 2.50, 5.0), "2026-11-19"),
 ];
 
 /// Family fallback (current generation) for ids not listed above.
@@ -65,10 +92,15 @@ const FAMILIES: &[(&str, Rates)] = &[
 
 /// The short badge for a model id: "claude-opus-5-5" → "opus". Unknown ids
 /// keep their first word after "claude-"; synthetic/empty ids give "".
+/// OpenAI ids give their last named word ("gpt-6-luna" → "luna"), or "gpt".
 pub fn family(model: &str) -> String {
     let m = model.to_ascii_lowercase();
     if m.is_empty() || m.starts_with('<') {
         return String::new();
+    }
+    if let Some(rest) = m.strip_prefix("gpt-") {
+        let named = rest.split(['-', '.']).rev().find(|w| w.len() > 1 && w.chars().all(|c| c.is_ascii_alphabetic()));
+        return named.unwrap_or("gpt").chars().take(6).collect();
     }
     for (fam, _) in FAMILIES {
         if m.contains(fam) {
@@ -163,7 +195,7 @@ impl Pricing {
 }
 
 fn builtin(model: &str) -> Option<Rates> {
-    if let Some((_, r)) = MODELS.iter().find(|(id, _)| *id == model) {
+    if let Some((_, r, _)) = MODELS.iter().find(|(id, _, _)| *id == model) {
         return Some(*r);
     }
     // Ids sometimes carry a date or platform suffix ("claude-opus-4-6-2026…",
@@ -177,10 +209,10 @@ fn builtin(model: &str) -> Option<Rates> {
                 .strip_prefix('-')
                 .is_some_and(|d| d.len() >= 8 && d.bytes().take(8).all(|b| b.is_ascii_digit()))
     };
-    if let Some((_, r)) = MODELS
+    if let Some((_, r, _)) = MODELS
         .iter()
-        .filter(|(id, _)| model.strip_prefix(id).is_some_and(is_suffix))
-        .max_by_key(|(id, _)| id.len())
+        .filter(|(id, _, _)| model.strip_prefix(id).is_some_and(is_suffix))
+        .max_by_key(|(id, _, _)| id.len())
     {
         return Some(*r);
     }
@@ -198,6 +230,19 @@ pub fn fmt_cost(c: f64) -> String {
         format!("${c:.1}")
     } else {
         format!("${c:.0}")
+    }
+}
+
+/// An API-equivalent estimate, for totals: "≈$0.42". Subscription plans
+/// aren't billed per token, so this is what the usage would cost on the
+/// pay-per-token API, not a bill. Sub-cent amounts keep a digit: "≈$0.004".
+pub fn approx_cost(c: f64) -> String {
+    if c > 0.0 && c < 0.0005 {
+        "≈<$0.001".into()
+    } else if c > 0.0 && c < 0.005 {
+        format!("≈${c:.3}")
+    } else {
+        format!("≈{}", fmt_cost(c))
     }
 }
 
@@ -244,6 +289,9 @@ mod tests {
         assert_eq!(family("<synthetic>"), "");
         assert_eq!(family(""), "");
         assert_eq!(family("claude-nova-1"), "nova");
+        assert_eq!(family("gpt-6-luna"), "luna");
+        assert_eq!(family("gpt-5"), "gpt");
+        assert_eq!(family("gpt-4o"), "gpt");
     }
 
     #[test]
@@ -275,6 +323,8 @@ mod tests {
         // unknown / synthetic model: free rather than invented
         assert_eq!(p.cost("<synthetic>", &one), 0.0);
         assert_eq!(p.cost("gpt-x", &one), 0.0);
+        assert!(p.rates("gpt-x").is_none(), "unknown: flagged as unpriced");
+        assert!(close(p.cost("gpt-6-luna", &u(1_000_000, 1_000_000, 1_000_000, 0, 0)), 0.61));
     }
 
     #[test]
@@ -296,6 +346,24 @@ mod tests {
         assert!(close(p.cost("claude-sonnet-5-5", &u(0, 1_000_000, 0, 0, 0)), 10.0));
     }
 
+    /// Every entry says when it was last checked, as a real date.
+    #[test]
+    fn every_model_has_a_verified_date() {
+        for (id, _, date) in MODELS {
+            let b = date.as_bytes();
+            let ok = b.len() == 10
+                && b[4] == b'-'
+                && b[7] == b'-'
+                && date.chars().filter(char::is_ascii_digit).count() == 8
+                && *date >= "2026-01-01";
+            assert!(ok, "{id}: bad verified date {date:?}");
+        }
+        // OpenAI's long (12h) cache write is its own price, not 2x input
+        assert_eq!(builtin("gpt-6-luna").unwrap().cache_write_1h, 0.25);
+        assert_eq!(builtin("gpt-6.1-terra").unwrap().cache_read, 0.05);
+        assert_eq!(family("gpt-6.1-terra"), "terra");
+    }
+
     #[test]
     fn cache_savings_is_read_tokens_at_the_input_discount() {
         let p = Pricing::default();
@@ -314,6 +382,10 @@ mod tests {
         assert_eq!(fmt_delta(0.00002), "+<.1¢");
         assert_eq!(fmt_cost(0.003), "<$0.01");
         assert_eq!(fmt_cost(0.0), "$0.00");
+        assert_eq!(approx_cost(0.0038), "≈$0.004");
+        assert_eq!(approx_cost(0.0001), "≈<$0.001");
+        assert_eq!(approx_cost(12.34), "≈$12.3");
+        assert_eq!(approx_cost(0.0), "≈$0.00");
         assert_eq!(fmt_tokens(950), "950");
         assert_eq!(fmt_tokens(12_300), "12.3k");
         assert_eq!(fmt_tokens(4_100_000), "4.1M");

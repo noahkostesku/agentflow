@@ -305,7 +305,7 @@ pub fn packets(sess: &Session, validators: &[String]) -> Vec<Packet> {
                 to: Some(i),
                 start: a.spawn,
                 dur: DISPATCH_MS,
-                label: format!("orchestrator \u{2192} {}", a.name),
+                label: format!("{} \u{2192} {}", sess.root_name(), a.name),
                 detail: "dispatch".into(),
             });
         }
@@ -322,7 +322,7 @@ pub fn packets(sess: &Session, validators: &[String]) -> Vec<Packet> {
             to: None,
             start: f,
             dur: if validator { VERDICT_MS } else { RETURN_MS },
-            label: format!("{} \u{2192} orchestrator", a.name),
+            label: format!("{} \u{2192} {}", a.name, sess.root_name()),
             detail,
         });
     }
@@ -508,7 +508,7 @@ pub fn panel(sess: &Session, t: i64, view: &View, w: i64) -> Option<(Vec<Line<'s
     };
     g.putc(cx, cy - 1, "◆", ac());
     g.putc(cx, cy, face, fc);
-    g.putc(cx, cy + 1, "orchestrator", B);
+    g.putc(cx, cy + 1, sess.root_name(), B);
     g.putc(cx, cy + 2, &status, sc);
 
     // 6. agents
@@ -535,7 +535,7 @@ pub fn panel(sess: &Session, t: i64, view: &View, w: i64) -> Option<(Vec<Line<'s
     // latest: the most recent packet (or the all-done line)
     let mut last = packets.iter().rfind(|p| p.start <= t).map(|p| (p.label.clone(), p.detail.clone()));
     if done {
-        last = Some(("orchestrator".into(), "all agents done ✓".into()));
+        last = Some((sess.root_name().into(), "all agents done ✓".into()));
     }
     let latest = match last {
         Some((label, detail)) => {

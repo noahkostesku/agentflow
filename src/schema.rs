@@ -10,8 +10,9 @@
 //!   * `agent_spawned` comes before any other event for that agent. It may be
 //!     re-emitted as the harness reveals more (a transcript id, a better type);
 //!     consumers merge: non-empty scalars replace, `ids` accumulate.
-//!   * the session's top-level thread is the agent [`MAIN`]; it is never
-//!     spawned.
+//!   * the session's top-level thread is the agent [`MAIN`]. No agent spawns
+//!     it, but an adapter may emit `agent_spawned` for it (no `parent`) to
+//!     record what the user asked, again on each new prompt.
 //!   * `tool_started` is emitted once per call id.
 
 use serde::{Deserialize, Serialize};
@@ -29,12 +30,14 @@ pub const MAIN: &str = "main";
 #[serde(rename_all = "lowercase")]
 pub enum Harness {
     Claude,
+    Codex,
 }
 
 impl Harness {
     pub fn name(self) -> &'static str {
         match self {
             Harness::Claude => "claude",
+            Harness::Codex => "codex",
         }
     }
 }

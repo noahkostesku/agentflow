@@ -21,7 +21,7 @@ use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::{cursor, execute, terminal};
 use ratatui::layout::Rect;
@@ -30,6 +30,7 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 
+use adapters::SourceAdapter;
 use config::Config;
 use pricing::Pricing;
 use render::{Panel, View};
@@ -54,12 +55,16 @@ struct Cli {
     #[arg(long)]
     calm: bool,
 
+    /// Which harness's sessions to watch.
+    #[arg(long, value_enum, default_value_t = Source::Claude, global = true)]
+    source: Source,
+
     /// Watch a specific session id instead of auto-detecting.
-    #[arg(long, value_name = "ID")]
+    #[arg(long, value_name = "ID", global = true)]
     session: Option<String>,
 
     /// Watch the session for a specific project path (default: cwd).
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", global = true)]
     project: Option<String>,
 
     /// Turn off achievement popups (overrides config).
@@ -98,8 +103,25 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
+/// A harness agentflow can read.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    Claude,
+    Codex,
+}
+
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Stream the watched session as normalized events (schema v1), one JSON
+    /// object per line on stdout: the session so far, then live as it grows.
+    Events {
+        /// JSON lines (the only format; accepted for clarity).
+        #[arg(long)]
+        json: bool,
+        /// Print what's on disk now and exit instead of following.
+        #[arg(long)]
+        once: bool,
+    },
     /// Your agents, wrapped: seven animated slides from your lifetime history
     /// (space / → next, ← back, q quit).
     Wrapped {
@@ -196,6 +218,12 @@ fn main() -> io::Result<()> {
         };
         return run_wrapped(range, export.as_deref(), slide.map(|n| (n, *at)));
     }
+    if let Some(Cmd::Events { once, .. }) = &cli.cmd {
+        let Some(target) = find(cli.source, cli.session.as_deref(), project.as_deref()) else {
+            no_session(cli.source, cli.session.as_deref());
+        };
+        return run_events(target.adapter, *once);
+    }
 
     let panel = match cli.panel.as_deref() {
         Some("stats") => Panel::Stats,
@@ -242,10 +270,9 @@ fn main() -> io::Result<()> {
     }
 
     // --- Live mode -------------------------------------------------------
-    let resolved = discovery::resolve(cli.session.as_deref(), project.as_deref());
-    match resolved {
-        Some(r) => {
-            let live = open_live(&r, &cwd);
+    match find(cli.source, cli.session.as_deref(), project.as_deref()) {
+        Some(target) => {
+            let live = open_live(cli.source, target.adapter, target.project_dir.as_deref(), &cwd);
             if let Some(ms) = cli.frame {
                 let sess = live.build(&set.pricing);
                 let t = live.clock();
@@ -253,19 +280,22 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             // Follow newer sessions unless pinned to one with --session.
-            let follow = cli.session.is_none().then(|| Follow {
+            let mut follow = cli.session.is_none().then(|| Follow {
                 project: project.clone(),
                 cwd: cwd.clone(),
-                fell_back: r.fell_back,
+                fell_back: target.fell_back,
             });
-            finish(run_live(live, &set, store, cli.calm, follow), warning)
+            let source = cli.source;
+            let mut next = |current: &Path| -> Option<live::Live> {
+                let fw = follow.as_mut()?;
+                let t = newer(source, fw, current)?;
+                fw.fell_back = t.fell_back;
+                Some(open_live(source, t.adapter, t.project_dir.as_deref(), &fw.cwd))
+            };
+            finish(run_live(live, &set, store, cli.calm, &mut next), warning)
         }
-        None if cli.session.is_some() => {
-            eprintln!(
-                "agentflow: no session \"{}\" found under ~/.claude/projects",
-                cli.session.as_deref().unwrap_or_default()
-            );
-            std::process::exit(1);
+        None if cli.session.is_some() || cli.source != Source::Claude => {
+            no_session(cli.source, cli.session.as_deref());
         }
         None => {
             // Nothing to watch anywhere — fall back to the demo so the tool
@@ -280,6 +310,79 @@ fn main() -> io::Result<()> {
     }
 }
 
+/// A session found to watch, in any harness.
+struct Target {
+    adapter: Box<dyn SourceAdapter>,
+    /// absolute project directory (best effort)
+    project_dir: Option<PathBuf>,
+    /// nothing matched the project: the most recent session anywhere
+    fell_back: bool,
+}
+
+/// The session to watch in `source`: `--session` anywhere, else the most
+/// recent one for the project (default: cwd), else the most recent anywhere.
+fn find(source: Source, session: Option<&str>, project: Option<&Path>) -> Option<Target> {
+    match source {
+        Source::Claude => discovery::resolve(session, project).map(|r| Target {
+            adapter: (&r).into(),
+            project_dir: r.project_dir,
+            fell_back: r.fell_back,
+        }),
+        Source::Codex => {
+            let root = adapters::codex::sessions_root();
+            let dir = project.map(Path::to_path_buf).or_else(|| std::env::current_dir().ok());
+            let exact = adapters::codex::find(&root, session, dir.as_deref(), false);
+            let fell_back = exact.is_none() && session.is_none();
+            let path = exact.or_else(|| fell_back.then(|| adapters::codex::find(&root, None, None, true)).flatten())?;
+            Some(Target { adapter: Box::new(adapters::codex::CodexAdapter::open(&path)), project_dir: None, fell_back })
+        }
+    }
+}
+
+fn no_session(source: Source, session: Option<&str>) -> ! {
+    let place = match source {
+        Source::Claude => "~/.claude/projects".to_string(),
+        Source::Codex => adapters::codex::sessions_root().display().to_string(),
+    };
+    match session {
+        Some(id) => eprintln!("agentflow: no session \"{id}\" found under {place}"),
+        None => eprintln!("agentflow: no {} session found under {place}", source.name()),
+    }
+    std::process::exit(1);
+}
+
+impl Source {
+    fn name(self) -> &'static str {
+        match self {
+            Source::Claude => "claude",
+            Source::Codex => "codex",
+        }
+    }
+}
+
+/// `agentflow events`: print each event as a JSON line, then keep polling.
+fn run_events(mut src: Box<dyn SourceAdapter>, once: bool) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    loop {
+        let mut write = || -> io::Result<()> {
+            for ev in src.poll() {
+                serde_json::to_writer(&mut out, &ev)?;
+                out.write_all(b"\n")?;
+            }
+            out.flush()
+        };
+        match write() {
+            // the reader went away (`| head`): done, not an error
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
+            r => r?,
+        }
+        if once {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
 /// Repeat a config warning after the TUI exits (the alternate screen hid it).
 fn finish(res: io::Result<()>, warning: Option<String>) -> io::Result<()> {
     if let Some(w) = warning {
@@ -288,18 +391,24 @@ fn finish(res: io::Result<()>, warning: Option<String>) -> io::Result<()> {
     res
 }
 
-/// Attach to a resolved session and read what's already on disk. The header
-/// uses the real cwd the session reported (handles --session and the
-/// fallback, where the storage dir name is path-encoded).
-fn open_live(r: &discovery::Resolved, cwd: &Path) -> live::Live {
-    let mut live = live::Live::new(r, String::new());
+/// Attach to a session and read what's already on disk. The header uses the
+/// real cwd the session reported (handles --session and the fallback, where
+/// Claude's storage dir name is path-encoded).
+fn open_live(source: Source, adapter: Box<dyn SourceAdapter>, project_dir: Option<&Path>, cwd: &Path) -> live::Live {
+    let mut live = live::Live::new(adapter, String::new());
     live.refresh();
     let hdr_dir = live
         .cwd()
         .map(PathBuf::from)
-        .or_else(|| r.project_dir.clone())
+        .or_else(|| project_dir.map(Path::to_path_buf))
         .unwrap_or_else(|| cwd.to_path_buf());
-    live.set_header(header_for(&hdr_dir));
+    live.set_header(match source {
+        Source::Claude => header_for(&hdr_dir),
+        other => {
+            let name = hdr_dir.file_name().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).unwrap_or("session");
+            format!("agentflow // {} // {name}", other.name())
+        }
+    });
     live
 }
 
@@ -325,6 +434,26 @@ fn newer_session(follow: &Follow, current: &Path) -> Option<discovery::Resolved>
         .duration_since(discovery::activity(current))
         .unwrap_or_default();
     (ahead >= Duration::from_secs(5)).then_some(cand)
+}
+
+/// A newer session to switch to, in any harness (see `newer_session`).
+fn newer(source: Source, follow: &Follow, current: &Path) -> Option<Target> {
+    match source {
+        Source::Claude => newer_session(follow, current).map(|r| Target {
+            adapter: (&r).into(),
+            project_dir: r.project_dir,
+            fell_back: r.fell_back,
+        }),
+        Source::Codex => {
+            let cand = find(source, None, follow.project.as_deref().or(Some(&follow.cwd)))?;
+            if cand.adapter.path() == current || (!follow.fell_back && cand.fell_back) {
+                return None;
+            }
+            let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            let ahead = mtime(cand.adapter.path()).duration_since(mtime(current)).unwrap_or_default();
+            (ahead >= Duration::from_secs(5)).then_some(cand)
+        }
+    }
 }
 
 /// Build the header "agentflow // <project> // <hash>" from a directory.
@@ -646,7 +775,7 @@ fn run_live(
     set: &Settings,
     store: lifetime::Store,
     calm: bool,
-    mut follow: Option<Follow>,
+    next: &mut dyn FnMut(&Path) -> Option<live::Live>,
 ) -> io::Result<()> {
     let mut term = enter()?;
     let mut rng = rand::thread_rng();
@@ -664,16 +793,13 @@ fn run_live(
             // Every ~2s, hop to a newer session (unless pinned by --session).
             if last_scan.elapsed() >= Duration::from_secs(2) {
                 last_scan = Instant::now();
-                if let Some(fw) = follow.as_mut() {
-                    if let Some(next) = newer_session(fw, live.path()) {
-                        persist.flush();
-                        fw.fell_back = next.fell_back;
-                        live = open_live(&next, &fw.cwd);
-                        sess = live.build(&set.pricing);
-                        app_start = Instant::now(); // replay the header intro
-                        ui.selected = None;
-                        ui.panel = ui.base;
-                    }
+                if let Some(newer) = next(live.path()) {
+                    persist.flush();
+                    live = newer;
+                    sess = live.build(&set.pricing);
+                    app_start = Instant::now(); // replay the header intro
+                    ui.selected = None;
+                    ui.panel = ui.base;
                 }
             }
             if last_refresh.elapsed() >= Duration::from_millis(300) {

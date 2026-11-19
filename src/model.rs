@@ -220,9 +220,23 @@ pub struct Session {
     pub epoch0: Option<i64>,
     /// agent → agent handoffs, in time order
     pub handoffs: Vec<Handoff>,
+    /// model ids with billed tokens but no known price (counted as $0)
+    pub unpriced: Vec<String>,
+    /// one agent working for the user (a harness without subagents): the
+    /// root of the tree is "you", not an orchestrator
+    pub solo: bool,
 }
 
 impl Session {
+    /// Who dispatches the agents: an orchestrator, or "you" when one agent
+    /// works for the user directly.
+    pub fn root_name(&self) -> &'static str {
+        if self.solo {
+            "you"
+        } else {
+            "orchestrator"
+        }
+    }
     /// Total session cost (orchestrator + every subagent) by time `t`.
     pub fn cost_at(&self, t: i64) -> f64 {
         let orch: f64 = self.orch_calls.iter().filter(|c| c.time <= t).map(|c| c.cost).sum();

@@ -15,7 +15,7 @@ use std::path::Path;
 use crate::adapters::{now_ms, SourceAdapter};
 use crate::model::{Agent, Call, Event, Handoff, Session, TestRun, Tool, ToolKind, Use, Usage};
 use crate::pricing::{self, Pricing};
-use crate::schema::{self, Body, MAIN};
+use crate::schema::{self, Body, Harness, MAIN};
 use crate::theme;
 
 /// A tool call that hasn't returned this long reads as "waiting". We can't see
@@ -74,6 +74,9 @@ pub struct Live {
     /// from `session_started`
     session: Option<String>,
     cwd: Option<String>,
+    harness: Option<Harness>,
+    /// `main` orchestrates subagents (true) or is the one working agent
+    subagents: bool,
     /// keyed by agent id; [`MAIN`] holds the orchestrator's calls
     accs: HashMap<String, Acc>,
     next_order: usize,
@@ -88,6 +91,8 @@ impl Live {
             header,
             session: None,
             cwd: None,
+            harness: None,
+            subagents: true,
             accs: HashMap::new(),
             next_order: 0,
             opened: now_ms(),
@@ -119,8 +124,10 @@ impl Live {
     pub fn apply(&mut self, ev: &schema::Event) {
         let ts = ev.ts;
         let Some(agent) = ev.agent() else {
-            if let Body::SessionStarted { cwd, .. } = &ev.body {
+            if let Body::SessionStarted { cwd, subagents } = &ev.body {
                 self.session = Some(ev.session.clone());
+                self.harness = Some(ev.harness);
+                self.subagents = *subagents;
                 if cwd.is_some() {
                     self.cwd = cwd.clone();
                 }
@@ -131,7 +138,7 @@ impl Live {
         let acc = self.acc(agent);
         // The agent's own records are signs of life (stuck detection); a spawn
         // or finish may be reported by its parent, so those don't count.
-        if !is_main && !matches!(ev.body, Body::AgentSpawned { .. } | Body::AgentFinished { .. }) {
+        if !matches!(ev.body, Body::AgentSpawned { .. } | Body::AgentFinished { .. }) {
             acc.first_ts.get_or_insert(ts);
             acc.last_ts = Some(acc.last_ts.map_or(ts, |l| l.max(ts)));
         }
@@ -160,6 +167,14 @@ impl Live {
             Body::ToolStarted { call, label, kind, tool, file, edit, arg, blocking, test, .. } => {
                 acc.denied = false; // it moved on: not stuck on the denial
                 acc.waiting = None;
+                // `main` finishes every turn in a harness without subagents;
+                // its next tool call means it's working again. (Subagents
+                // don't reopen: their own records can arrive after a finish
+                // their parent reported.)
+                if is_main {
+                    acc.finished = false;
+                    acc.done_ts = None;
+                }
                 let kind = match kind {
                     schema::ToolKind::Look => ToolKind::Look,
                     schema::ToolKind::Run => ToolKind::Run,
@@ -245,18 +260,26 @@ impl Live {
 
     /// Build the render model for the current instant.
     pub fn build(&self, pricing: &Pricing) -> Session {
+        // `main` is a row only when it's the one working agent
+        let rows = |k: &str| k != MAIN || !self.subagents;
         let mut accs: Vec<(&str, &Acc)> =
-            self.accs.iter().filter(|(k, _)| *k != MAIN).map(|(k, a)| (k.as_str(), a)).collect();
+            self.accs.iter().filter(|(k, _)| rows(k)).map(|(k, a)| (k.as_str(), a)).collect();
         accs.sort_by_key(|(_, a)| (a.spawn_ms.or(a.first_ts).unwrap_or(i64::MAX), a.order));
         let root = self.cwd.as_deref().map(|c| c.trim_end_matches('/').to_string() + "/");
 
         let now = now_ms();
         let t0 = self.origin().unwrap_or(now);
+        let boss = if self.subagents { "orchestrator" } else { "you" };
 
         let mut agents = Vec::new();
         let mut events: Vec<Event> = Vec::new();
         for &(key, a) in &accs {
-            let role = a.role.clone();
+            // the one agent of a harness without subagents goes by the harness
+            let role = match (key == MAIN, self.harness) {
+                (true, Some(h)) if a.role.is_empty() => h.name().to_string(),
+                (true, None) if a.role.is_empty() => "agent".to_string(),
+                _ => a.role.clone(),
+            };
             let spawn_ms = a.spawn_ms.or(a.first_ts).unwrap_or(t0);
             let spawn = spawn_ms - t0;
             let finish = a
@@ -284,7 +307,7 @@ impl Live {
 
             events.push(Event {
                 time: spawn,
-                label: format!("orchestrator \u{2192} {role}"),
+                label: format!("{boss} \u{2192} {role}"),
                 detail: "dispatch".into(),
                 color: theme::B,
             });
@@ -315,7 +338,7 @@ impl Live {
             if let Some(f) = finish {
                 events.push(Event {
                     time: f,
-                    label: format!("{role} \u{2192} orchestrator"),
+                    label: format!("{role} \u{2192} {boss}"),
                     detail: format!("result {size}"),
                     color: theme::B,
                 });
@@ -411,7 +434,17 @@ impl Live {
             events.drain(0..events.len() - keep);
         }
 
-        let main = self.accs.get(MAIN);
+        let main = self.accs.get(MAIN).filter(|_| self.subagents);
+        // models with billed tokens but no price: they count as $0, flagged
+        let mut unpriced: Vec<String> = self
+            .accs
+            .values()
+            .flat_map(|a| a.usage.values())
+            .map(|(_, _, m)| m.clone())
+            .filter(|m| !m.is_empty() && pricing.rates(m).is_none())
+            .collect();
+        unpriced.sort();
+        unpriced.dedup();
         Session {
             header: self.header.clone(),
             id: self.session.clone(),
@@ -424,6 +457,8 @@ impl Live {
             orch_calls: main.map_or_else(Vec::new, |m| priced(&m.usage, t0, pricing)),
             epoch0: Some(t0),
             handoffs,
+            unpriced,
+            solo: !self.subagents,
         }
     }
 
@@ -431,7 +466,7 @@ impl Live {
     fn origin(&self) -> Option<i64> {
         self.accs
             .iter()
-            .filter(|(k, _)| *k != MAIN)
+            .filter(|(k, _)| *k != MAIN || !self.subagents)
             .filter_map(|(_, a)| a.spawn_ms.or(a.first_ts))
             .min()
     }
@@ -615,5 +650,28 @@ mod tests {
             tool(200, "a", "c2"),
         ]);
         assert!(!s.agents[0].error, "cleared by its next tool call");
+    }
+
+    /// Without subagents `main` is the one row, named for the harness; it
+    /// finishes each turn and reopens on its next tool call. A subagent
+    /// whose own records land after its parent reported it done stays done.
+    #[test]
+    fn solo_main_reopens_subagents_dont() {
+        let fin = |ts, agent: &str| {
+            ev(ts, Body::AgentFinished { agent: agent.into(), result: Some("ok".into()), bytes: None, error: false })
+        };
+        let solo = |more: Vec<Ev>| {
+            let mut evs = vec![ev(0, Body::SessionStarted { cwd: None, subagents: false }), tool(100, MAIN, "c1"), fin(200, MAIN)];
+            evs.extend(more);
+            run(evs)
+        };
+        let s = solo(vec![]);
+        assert_eq!((s.agents.len(), s.agents[0].name.as_str()), (1, "claude"));
+        assert!(s.agents[0].finish.is_some(), "turn over");
+        let s = solo(vec![tool(300, MAIN, "c2")]);
+        assert!(s.agents[0].finish.is_none(), "next turn: working again");
+
+        let s = run(vec![spawn(0, "a", "fixer"), fin(500, "a"), tool(100, "a", "c1")]);
+        assert!(s.agents[0].finish.is_some());
     }
 }

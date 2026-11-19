@@ -19,7 +19,7 @@ these fields, plus the fields of its `type`:
 | field     | type    | meaning |
 |-----------|---------|---------|
 | `v`       | integer | schema version, `1` |
-| `harness` | string  | `claude` (more as adapters land) |
+| `harness` | string  | `claude`, `codex` |
 | `session` | string  | the harness's own session id |
 | `ts`      | integer | epoch milliseconds when it happened, as the harness recorded it |
 | `type`    | string  | one of the event types below |
@@ -31,7 +31,9 @@ within v1. Removing a field or changing its meaning bumps `v`.
 ## Agents
 
 Most events name an `agent`: an id unique within the session. The session's
-top-level thread is always the agent **`main`**. It is never spawned.
+top-level thread is always the agent **`main`**. No agent spawns it, but an
+adapter may emit `agent_spawned` for `main` (with no `parent`) to record what
+the user asked as its `prompt`, again on each new prompt.
 
 - In a harness with subagents (`session_started.subagents: true`), `main` is
   the orchestrator: its usage is the orchestrator's cost, and every other
@@ -189,7 +191,8 @@ don't record this rely on the `blocking` inference instead.
 
 ### `agent_finished`
 
-The agent finished and handed back.
+The agent finished and handed back. For `main` in a harness without
+subagents this ends a turn: its next `tool_started` means it's working again.
 
 | field    | type     | meaning |
 |----------|----------|---------|

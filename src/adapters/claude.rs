@@ -73,6 +73,10 @@ pub struct ClaudeAdapter {
     main: Sub,
     /// agentId -> spawn tool_use id, for subagent files already linked
     linked: HashMap<String, String>,
+    /// the session's permission mode ("default", "auto", "acceptEdits",
+    /// "plan", "bypassPermissions"), as last recorded: which tool calls can
+    /// sit at an approval prompt
+    mode: String,
 }
 
 impl From<&Resolved> for Box<dyn SourceAdapter> {
@@ -120,6 +124,7 @@ impl ClaudeAdapter {
             subs: HashMap::new(),
             main: Sub::default(),
             linked: HashMap::new(),
+            mode: "default".into(),
         }
     }
 
@@ -148,7 +153,10 @@ impl ClaudeAdapter {
     fn main_line(&mut self, line: &str, out: &mut Vec<Event>) {
         let session = self.session.clone();
         let ev = |ts: i64, body: Body| Event::new(Harness::Claude, &session, ts, body);
-        sub_line(line, MAIN, &mut self.main, out, &ev, true);
+        if let Some(mode) = permission_mode(line) {
+            self.mode = mode.to_string();
+        }
+        sub_line(line, MAIN, &mut self.main, out, &ev, true, &self.mode);
         let prompt_line = line.contains("\"type\":\"user\"") && !line.contains("tool_result");
         if !prompt_line && !line.contains("\"end_turn\"") {
             return;
@@ -166,6 +174,13 @@ impl ClaudeAdapter {
                 let Some(text) = v.pointer("/message/content").and_then(prompt_text) else {
                     return;
                 };
+                // Esc mid-turn: Claude Code logs this marker instead of a
+                // final message. The turn is over; it's not a prompt.
+                if text.starts_with("[Request interrupted by user") {
+                    let body = Body::AgentFinished { agent: MAIN.into(), result: None, bytes: None, error: false };
+                    out.push(ev(at, body));
+                    return;
+                }
                 out.push(ev(
                     at,
                     Body::AgentSpawned {
@@ -385,6 +400,8 @@ impl ClaudeAdapter {
     fn tail_subagent(&mut self, tool_use_id: &str, out: &mut Vec<Event>) {
         let session = self.session.clone();
         let ev = |ts: i64, body: Body| Event::new(Harness::Claude, &session, ts, body);
+        // subagents run under the session's permission mode
+        let mode = self.mode.clone();
         let Some(sub) = self.subs.get_mut(tool_use_id) else {
             return;
         };
@@ -400,7 +417,7 @@ impl ClaudeAdapter {
                     sub.last_ts = Some(sub.last_ts.map_or(ts, |l| l.max(ts)));
                 }
                 let before = batch.len();
-                sub_line(&line, &agent, sub, &mut batch, &ev, false);
+                sub_line(&line, &agent, sub, &mut batch, &ev, false, &mode);
                 // nothing else said it was active: a heartbeat does
                 let quiet = batch[before..].iter().all(|e| matches!(e.body, Body::AgentFinished { .. }));
                 if let (true, Some(ts)) = (quiet, qts) {
@@ -467,7 +484,7 @@ impl ClaudeAdapter {
 }
 
 /// One subagent transcript line → events for `agent`.
-fn sub_line(line: &str, agent: &str, sub: &mut Sub, out: &mut Vec<Event>, ev: &dyn Fn(i64, Body) -> Event, main: bool) {
+fn sub_line(line: &str, agent: &str, sub: &mut Sub, out: &mut Vec<Event>, ev: &dyn Fn(i64, Body) -> Event, main: bool, mode: &str) {
     // tool_use blocks, tool_result blocks (which carry "tool_use_id"),
     // and billed assistant messages
     if !line.contains("tool_use") && !line.contains("\"usage\"") {
@@ -532,10 +549,16 @@ fn sub_line(line: &str, agent: &str, sub: &mut Sub, out: &mut Vec<Event>, ev: &d
                         file: touched_file(name, block),
                         edit: is_edit(name),
                         arg: short_arg(name, block),
-                        blocking: can_prompt(name),
+                        blocking: can_prompt(name, mode),
                         test: name == "Bash" && !id.is_empty() && cmd.is_some_and(is_test_command),
                     },
                 ));
+                // A question for the user or a plan to approve: blocked on
+                // them from the moment it's asked, until its result lands.
+                if let Some(reason) = asks_user(name) {
+                    let call = (!id.is_empty()).then(|| id.to_string());
+                    out.push(ev(at, Body::Waiting { agent: agent.to_string(), call, reason: reason.into() }));
+                }
                 if let Some((to, len)) = team_message(name, block) {
                     out.push(ev(
                         at,
@@ -735,6 +758,9 @@ fn short_arg(name: &str, block: &Value) -> String {
         }
         "WebSearch" => get("query").to_string(),
         "Agent" | "Task" => get("description").to_string(),
+        "AskUserQuestion" => block.pointer("/input/questions/0/question").and_then(Value::as_str).unwrap_or("").to_string(),
+        // the plan's first line, minus its markdown heading marks
+        "ExitPlanMode" => get("plan").lines().map(|l| l.trim().trim_start_matches('#').trim()).find(|l| !l.is_empty()).unwrap_or("").to_string(),
         _ => String::new(),
     };
     s.lines().next().unwrap_or("").to_string()
@@ -806,13 +832,43 @@ pub fn read_cwd(path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Tools that can block on a permission prompt (mutating / external). Pure
-/// reads return instantly and never prompt, so a pending read isn't a wait.
-fn can_prompt(name: &str) -> bool {
-    matches!(
-        name,
-        "Bash" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "WebFetch" | "WebSearch"
-    )
+/// Tools whose whole point is to wait on the user: a question, or a plan to
+/// approve. Their `tool_use` is the prompt; the `tool_result` is the answer.
+fn asks_user(name: &str) -> Option<&'static str> {
+    match name {
+        "AskUserQuestion" => Some("question"),
+        "ExitPlanMode" => Some("plan approval"),
+        _ => None,
+    }
+}
+
+/// Tools that can sit at a permission prompt under the session's permission
+/// mode. Pure reads return instantly and never prompt, so a pending read
+/// isn't a wait. Observed on real sessions:
+///   * `bypassPermissions` never asks.
+///   * `auto` asks about ~3% of shell calls, while ~6% of the ones it allows
+///     run past 10s: a slow shell call there is running, not waiting (it
+///     would be wrong three times in four). An edit returns at once unless
+///     it's being asked about, so an open edit still reads as waiting.
+///   * `acceptEdits` accepts edits; shell calls can still ask.
+///   * `default` and `plan`: any of them can.
+fn can_prompt(name: &str, mode: &str) -> bool {
+    let edit = matches!(name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit");
+    let other = matches!(name, "Bash" | "WebFetch" | "WebSearch");
+    match mode {
+        "bypassPermissions" => false,
+        "auto" => edit,
+        "acceptEdits" => other,
+        _ => edit || other,
+    }
+}
+
+/// `"permissionMode":"auto"` on a line (a `permission-mode` record, or a
+/// prompt), without parsing it.
+fn permission_mode(line: &str) -> Option<&str> {
+    let i = line.find("\"permissionMode\":\"")? + 18;
+    let rest = line.get(i..)?;
+    rest.get(..rest.find('"')?).filter(|m| !m.is_empty())
 }
 
 /// Map a Claude Code tool name to a face-driving kind.
@@ -973,6 +1029,31 @@ fn newest_jsonl(dir: &Path) -> Option<(PathBuf, SystemTime)> {
         }
     }
     best
+}
+
+/// Every session, in any project, that showed signs of life at or after
+/// `since` (its transcript or a subagent's), with that activity and the
+/// project's storage dir.
+pub fn active(root: &Path, since: SystemTime) -> Vec<(PathBuf, SystemTime)> {
+    let mut out = Vec::new();
+    let Ok(projects) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for dir in projects.flatten().map(|e| e.path()).filter(|d| d.is_dir()) {
+        let Ok(files) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for path in files.flatten().map(|e| e.path()) {
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let when = activity(&path);
+            if when >= since {
+                out.push((path, when));
+            }
+        }
+    }
+    out
 }
 
 /// The session for `session` anywhere; else `project`'s newest; else, with
@@ -1311,6 +1392,103 @@ mod tests {
         assert!(!s.solo);
         assert_eq!(s.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["scout"]);
         assert_eq!(s.orch_calls.len(), 2, "main's billed calls are the orchestrator's now");
+    }
+
+    /// A question or a plan to approve waits on the user from the moment
+    /// it's asked; a rejected call is an error; Esc mid-turn ends the turn
+    /// (it isn't a prompt).
+    #[test]
+    fn questions_plans_rejections_and_interrupts() {
+        let dir = std::env::temp_dir().join(format!("aflow-ask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("ask.jsonl");
+        let append = |lines: &[&str]| {
+            let old = std::fs::read_to_string(&main).unwrap_or_default();
+            std::fs::write(&main, old + &lines.join("\n") + "\n").unwrap();
+        };
+        let resolved = Resolved { path: main.clone(), project_dir: None, fell_back: false };
+        let now = iso_to_ms("2026-01-01T00:10:00.000Z").unwrap();
+        let p = &Pricing::default();
+
+        append(&[
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/w","message":{"content":"set up the db"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"id":"a1","model":"claude-opus-5-5","stop_reason":"tool_use","content":[{"type":"tool_use","id":"q1","name":"AskUserQuestion","input":{"questions":[{"question":"Postgres or SQLite?","options":[]}]}}]}}"#,
+        ]);
+        let mut live = Live::new(&resolved, "h".into());
+        live.refresh();
+        let pulse = live.pulse(p, now);
+        assert_eq!(pulse.waiting, Some((iso_to_ms("2026-01-01T00:00:01.000Z").unwrap(), "question: Postgres or SQLite?".into())));
+
+        append(&[
+            r#"{"type":"user","timestamp":"2026-01-01T00:01:00.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"q1","content":"Postgres"}]}}"#,
+            r##"{"type":"assistant","timestamp":"2026-01-01T00:01:05.000Z","message":{"id":"a2","model":"claude-opus-5-5","stop_reason":"tool_use","content":[{"type":"tool_use","id":"x1","name":"ExitPlanMode","input":{"plan":"\n# Add a Postgres pool\n\n1. ..."}}]}}"##,
+        ]);
+        live.refresh();
+        let pulse = live.pulse(p, now);
+        assert_eq!(pulse.waiting.map(|w| w.1).as_deref(), Some("plan approval: Add a Postgres pool"));
+
+        append(&[
+            r#"{"type":"user","timestamp":"2026-01-01T00:02:00.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"x1","content":"approved"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:02:05.000Z","message":{"id":"a3","model":"claude-opus-5-5","stop_reason":"tool_use","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"dropdb prod_copy"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:02:30.000Z","permissionDecision":{"decision":"reject"},"message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":true,"content":"The user doesn't want to proceed with this tool use."}]}}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:02:30.100Z","message":{"content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}"#,
+        ]);
+        live.refresh();
+        let pulse = live.pulse(p, now);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(pulse.waiting, None);
+        assert!(!pulse.running, "the interrupt ended the turn");
+        assert_eq!(pulse.error.map(|e| e.1).as_deref(), Some("rejected $ dropdb prod_copy"));
+        let s = live.build(p);
+        assert_eq!(s.agents[0].task, "set up the db", "the interrupt marker isn't a prompt");
+    }
+
+    /// The session's permission mode decides which open calls read as
+    /// waiting: in auto mode a long shell call is running, an open edit is
+    /// being asked about; in default mode both can be prompts.
+    #[test]
+    fn permission_mode_decides_what_can_wait() {
+        let dir = std::env::temp_dir().join(format!("aflow-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("mode.jsonl");
+        let call = |ts: &str, id: &str, tool: &str, input: &str| {
+            format!(r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:{ts}.000Z","message":{{"id":"{id}","model":"claude-opus-5-5","stop_reason":"tool_use","content":[{{"type":"tool_use","id":"{id}","name":"{tool}","input":{input}}}]}}}}"#)
+        };
+        let lines = [
+            r#"{"type":"permission-mode","permissionMode":"auto","sessionId":"mode"}"#.to_string(),
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/w","permissionMode":"auto","message":{"content":"build it"}}"#.to_string(),
+            call("01", "b1", "Bash", r#"{"command":"cargo build --release"}"#),
+        ];
+        std::fs::write(&main, lines.join("\n") + "\n").unwrap();
+        let resolved = Resolved { path: main.clone(), project_dir: None, fell_back: false };
+        let mut live = Live::new(&resolved, "h".into());
+        live.refresh();
+        let later = iso_to_ms("2026-01-01T00:05:00.000Z").unwrap();
+        let p = live.pulse(&Pricing::default(), later);
+        assert_eq!(p.waiting, None, "auto mode: a 5-minute build is running");
+        assert!(p.in_flight);
+
+        let more = [
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:02.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"b1","content":"ok"}]}}"#.to_string(),
+            call("03", "w1", "Write", r#"{"file_path":"/w/notes.md","content":"x"}"#),
+        ];
+        std::fs::write(&main, std::fs::read_to_string(&main).unwrap() + &more.join("\n") + "\n").unwrap();
+        live.refresh();
+        let p = live.pulse(&Pricing::default(), later);
+        assert_eq!(p.waiting.map(|w| w.1).as_deref(), Some("write notes.md"), "an edit that hasn't landed is being asked about");
+
+        let more = [
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:04.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"w1","content":"ok"}]}}"#.to_string(),
+            r#"{"type":"permission-mode","permissionMode":"default","sessionId":"mode"}"#.to_string(),
+            call("05", "b2", "Bash", r#"{"command":"git push"}"#),
+        ];
+        std::fs::write(&main, std::fs::read_to_string(&main).unwrap() + &more.join("\n") + "\n").unwrap();
+        live.refresh();
+        let p = live.pulse(&Pricing::default(), later);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(p.waiting.map(|w| w.1).as_deref(), Some("$ git push"), "default mode: it may be a prompt");
+        assert_eq!(permission_mode(r#"{"permissionMode":"plan"}"#), Some("plan"));
+        assert_eq!(permission_mode(r#"{"permissionMode":""}"#), None);
     }
 
     #[test]

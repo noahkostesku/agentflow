@@ -122,7 +122,7 @@ An agent invoked a tool.
 | `file`     | string? | the file it reads or writes |
 | `edit`     | bool    | it modifies a file |
 | `arg`      | string? | a few words of argument: `cargo test -q`, `lib.rs`, a host |
-| `blocking` | bool    | it can block on an approval prompt; one pending for 10s+ reads as *waiting* |
+| `blocking` | bool    | it can block on an approval prompt (under the session's permission mode, where the harness records one); one pending for 10s+ reads as *waiting* |
 | `test`     | bool    | it runs a test suite; its `tool_finished.error` is the outcome |
 
 ```json
@@ -194,15 +194,18 @@ prompt aren't events: consumers detect those from `prompt` and `result`.
 
 ### `waiting`
 
-The agent is blocked on the user (an approval prompt), as the harness
-recorded it. Cleared by the agent's next tool or finish event. Harnesses that
-don't record this rely on the `blocking` inference instead.
+The agent is blocked on the user, as the harness recorded it: an approval
+prompt, a question, a plan to approve. Cleared by the agent's next tool or
+finish event. Claude Code's `AskUserQuestion` (`question`) and `ExitPlanMode`
+(`plan approval`) and Codex's `request_user_input` (`question`) emit it the
+moment they're called. Approval prompts aren't recorded by either harness, so
+those rely on the `blocking` inference instead.
 
 | field    | type    | meaning |
 |----------|---------|---------|
 | `agent`  | string  | |
-| `call`   | string? | the call waiting for approval |
-| `reason` | string? | e.g. `approval` |
+| `call`   | string? | the call waiting on the user |
+| `reason` | string? | `approval`, `question`, `plan approval` |
 
 ```json
 {"v":1,"harness":"claude","session":"8f2c1e","ts":1795069303000,"type":"waiting","agent":"toolu_01A","call":"toolu_01C","reason":"approval"}

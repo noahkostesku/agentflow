@@ -4,6 +4,57 @@ All notable changes to agentflow. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Inbox** (`agentflow inbox`, or `i` from any view): every session active
+  in the last 30 minutes, across all projects and harnesses, one line each,
+  sorted by urgency: waiting on you, error, stuck, done but not reviewed,
+  working, idle. Each line shows what it's doing or waiting on, agents
+  running/total, time in that state and ≈cost. `Enter` opens the session in
+  the usual views, `Esc` comes back, `r` marks a done session reviewed
+  (kept in `~/.agentflow/reviewed.json`). `inbox --demo` shows a scripted one.
+- **Notifications** (`agentflow notify`, headless, or `inbox --notify`): a
+  desktop notification (`osascript` on macOS, `notify-send` on Linux) when a
+  session starts waiting, errors, gets stuck or finishes. One per state
+  change per session, silent on startup, with per-state toggles, quiet
+  hours and a repeat guard in `[notify]`. `--dry-run` and `--once` for
+  checking it.
+- Config: `[inbox] active_minutes`, and `[notify]` (`waiting`, `error`,
+  `stuck`, `done`, `quiet`, `repeat_after`).
+- **Closed sessions** in the inbox: a waiting or working session whose
+  `claude` / `codex` process is gone (terminal closed, process killed) shows
+  dim as "closed while waiting" below the urgent states, instead of needing
+  you forever. Processes are matched by session id on the command line, else
+  by working directory; where they can't be seen, 12 hours of quiet marks a
+  session stale.
+
+### Changed
+
+- **Waiting is detected more precisely.** Claude Code's `AskUserQuestion`
+  and `ExitPlanMode` and Codex's `request_user_input` read as waiting the
+  moment they're called, with the question shown. The "a call that can
+  prompt hasn't returned for 10s" inference now follows each session's
+  permissions: Claude Code's permission mode (a slow shell command in `auto`
+  or `bypassPermissions` mode is running, not waiting; edits in
+  `acceptEdits` don't wait) and Codex's approval policy (under `on-request`,
+  only escalated commands can wait). This applies to every view, not just
+  the inbox.
+- An interrupted turn (Esc in Claude Code, `turn_aborted` in Codex) ends the
+  turn instead of reading as a new prompt or a stuck agent.
+- **One duration format everywhere** (tree rows, labels, recap, detail,
+  timeline, stats, lifetime, wrapped, inbox): `42s`, `17m 55s` (seconds
+  always two digits, so `2m 00s` keeps its width), `1h 02m` in aligned
+  columns where a value ticks in place; labels and prose drop the padding
+  and zero parts (`active ≤ 30m`, `8m of work in 3m`, `1h 2m`). A tree row's
+  time always has a space before it (no more `⠴2673s`), and its progress bar
+  is 7 cells to make room. A call in flight past `stuck_after` now reads
+  `busy 2m 05s` (was `running 2m`), which fits the 12-column status.
+- In a solo session (no subagents) the "you" row reads `waiting on claude`
+  (or `codex`) while the agent works, and `all done ✓` after; `delegating`
+  is kept for sessions with subagents.
+
 ## [0.2.0] - 2026-11-19
 
 agentflow is now harness-agnostic: one live view of every coding agent you run.

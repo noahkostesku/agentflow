@@ -73,7 +73,7 @@ pub fn unlocks(s: &Session, t: i64) -> Vec<Unlock> {
         // contradicts the timer on screen.
         let took = ((f - a.spawn).max(0) as f64 * scale) as i64;
         if !a.error && took < SPEEDRUN_MS {
-            first(Kind::Speedrun, f, format!("{} · {}s", a.name, took / 1000));
+            first(Kind::Speedrun, f, format!("{} · {}", a.name, crate::duration::compact(took)));
         }
         if !a.error && !a.uses.iter().any(|u| u.edit && u.time <= f) {
             first(Kind::Pacifist, f, format!("{} · zero edits", a.name));
@@ -613,7 +613,7 @@ mod tests {
     }
 
     /// A tool call still in flight (tool_use, no tool_result yet) means busy:
-    /// "running 2m", never the sleepy face. Only silence with nothing in
+    /// "busy 2m 30s", never the sleepy face. Only silence with nothing in
     /// flight reads as stuck.
     #[test]
     fn in_flight_tool_call_is_running_not_stuck() {

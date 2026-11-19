@@ -32,6 +32,10 @@ Only the schema.
 | discovery | `src/discovery.rs` | each adapter's `find` / `activity` | which session(s) to watch |
 | reducer | `src/live.rs` | schema events only | the render model (`model::Session`) for one session |
 | mixed view | `src/mixed.rs` | `model::Session`s | one `Session` with a group per harness |
+| inbox | `src/inbox.rs` | each session's `live::Pulse` | one line per active session, by urgency |
+| notifications | `src/notify.rs` | inbox entries | desktop notifications on state changes |
+| processes | `src/procs.rs` | `ps`, `lsof` / `/proc` | which `claude` / `codex` processes run where (closed sessions) |
+| durations | `src/duration.rs` | | the one duration format (`42s`, `17m 55s`, `1h 02m`) |
 | consumers | `render.rs`, `orbit.rs`, `stats.rs`, `lifetime.rs`, `wrapped.rs` | `model::Session` only | frames, stats, lifetime history |
 
 `SourceAdapter::poll()` returns whatever is new on disk as events. The live
@@ -56,6 +60,30 @@ Each adapter knows where its harness stores sessions
   recently active session for the project, keeping only those active in the
   last 10 minutes; if none is, each harness's most recent. With none for the
   project, the same rule over every project.
+
+- **inbox** (`agentflow inbox`, `discovery::find_active_at`): every
+  session in every project and harness written to in the last
+  `[inbox] active_minutes` (30), subagents' writes included. Each adapter
+  lists its own (`adapters::<harness>::active`).
+
+## The inbox and notifications
+
+`inbox::Inbox` holds one `live::Live` per active session, the same reducer
+the views use. Instead of a render model it asks each for a `Pulse`
+(`Live::pulse`): is any agent waiting on the user (an explicit `waiting`
+event, or a `blocking` call open 10s+), in error, running, with a call in
+flight; its latest tool call, last message, agent counts and cost.
+`inbox::classify` turns a pulse into a state (waiting, error, stuck, done,
+working, idle) and the time it began; rows sort by that. A session counts
+by its own latest event, not its file's mtime (harnesses append bookkeeping
+records long after the work ends).
+
+`notify::Notifier` watches those states and emits one notification per
+change per session; `notify::Watcher` keeps an `Inbox` current on its own
+clock for both `agentflow notify` (headless) and `agentflow inbox --notify`.
+Reviewed marks live in `~/.agentflow/reviewed.json`. `inbox::settle` checks
+open sessions against `procs::scan` (every 10s) and marks the ones whose
+process is gone as closed; with no process view it falls back to 12h of quiet.
 
 ## The mixed view
 

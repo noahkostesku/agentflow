@@ -613,7 +613,7 @@ fn draw(sess: &Session, t: i64, view: &View, gw: usize, gh: usize) -> Option<(Ve
     } else if sess.agents.is_empty() {
         ("waiting".into(), D)
     } else {
-        (format!("delegating {}", SPIN[(t / 80).rem_euclid(10) as usize]), D)
+        (crate::render::root_working(sess, t), D)
     };
     g.putc(cx, cy - 1, "◆", ac());
     g.putc(cx, cy, face, fc);
@@ -739,7 +739,10 @@ fn label(sess: &Session, i: usize, t: i64, view: &View, flash: bool) -> Label {
     let (status, status_c) = if let Some(idle) = stuck {
         (idle_label(idle), AM)
     } else if let Some(ms) = running {
-        (format!("{} {}", running_label(ms), SPIN[((t / 400) + i as i64).rem_euclid(10) as usize]), G)
+        // the slow spinner rides along when it fits the 13-wide label
+        let label = running_label(ms);
+        let spin = SPIN[((t / 400) + i as i64).rem_euclid(10) as usize];
+        (if label.chars().count() <= 11 { format!("{label} {spin}") } else { label }, G)
     } else if wait {
         (if sess.live { "waiting" } else { "permission" }.to_string(), AM)
     } else if validator {

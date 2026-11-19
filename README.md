@@ -497,6 +497,7 @@ better or worse, and which agent should you fix?
 agentflow profile                       # your workflows: runs, medians, trends
 agentflow profile --workflow pr-review  # straight to one workflow's detail
 agentflow profile --demo                # seeded history (12 runs, one regression)
+agentflow profile --import              # backfill history from every past session
 agentflow compare 1 2                   # the latest run against the one before
 agentflow compare 3f2a91c0 9be0d4e1     # two runs by id prefix, any harness
 agentflow compare 1 2 --workflow pr-review  # numbers count within a workflow
@@ -506,12 +507,22 @@ agentflow compare 1 2 --workflow pr-review  # numbers count within a workflow
 project, harness, start, wall time (orchestrator included), total agent time,
 the critical path, peak and average concurrency, ≈cost and tokens per agent
 (role and model), tool calls, errors, and outcome (did the last test command
-pass, did any agent end in error or never report back). Live mode records a
-session 30s after its batch of agents finishes (so the orchestrator's wrap-up
-counts) and on exit; `profile` and `compare` also index the current project's
+pass, did any agent end in error or never report back). A session is recorded
+30s after its agents all finish (so the orchestrator's wrap-up counts): by
+live mode for the session you're watching (and on exit), and by the inbox and
+`agentflow notify` for every session that finishes, so history builds without
+a view open. `profile` and `compare` also index the current project's
 sessions (`--project` for another) that have been quiet for 10 minutes and
 aren't on record yet. With `persistence` off nothing is recorded; `profile`
 then shows only what it indexes from the project's sessions.
+
+**Backfill.** `agentflow profile --import` reads every stored session of
+every supported harness, in all projects (`--source claude` or `codex` to
+narrow), and records the finished ones that aren't on record yet, then
+prints a summary ("imported 87 runs across 12 workflows"). It only reads the
+harnesses' files and writes only `runs.jsonl`. Sessions already recorded are
+skipped, so running it again adds nothing new. Sessions active in the last 10
+minutes are left until they finish.
 
 **Workflows.** Runs group by project plus the set of agent roles (a Codex
 subagent counts by its path, `repo_overview`, not its nickname). Name one, and

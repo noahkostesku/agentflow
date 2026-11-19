@@ -24,6 +24,7 @@ use crate::live::{Live, Pulse};
 use crate::pricing::{approx_cost, Pricing};
 use crate::procs::{self, Alive, Proc};
 use crate::render::{clen, ctake, lpad, pad, sp, SPIN};
+use crate::runs::{self, Recorder};
 use crate::schema::Harness;
 use crate::theme::*;
 
@@ -274,6 +275,8 @@ struct Watched {
     /// its state at the last `entries` call: a waiting or errored session
     /// stays in the inbox past the active window
     state: State,
+    /// the latest sign of life (epoch ms) as of which its run was recorded
+    recorded: Option<i64>,
 }
 
 /// Every active session, watched.
@@ -285,6 +288,8 @@ pub struct Inbox {
     alive: Alive,
     /// when `alive` was last looked at
     looked: Option<std::time::Instant>,
+    /// records a run for every session that finishes (`persistence` on)
+    runs: Option<Recorder>,
 }
 
 /// How often to look at the process table (a `ps`, plus `lsof` on macOS).
@@ -292,7 +297,15 @@ const PROCS_EVERY: Duration = Duration::from_secs(10);
 
 impl Inbox {
     pub fn new(harnesses: &[Harness], window: Duration) -> Inbox {
-        Inbox { harnesses: harnesses.to_vec(), window, watched: Vec::new(), alive: Alive::Unknown, looked: None }
+        Inbox { harnesses: harnesses.to_vec(), window, watched: Vec::new(), alive: Alive::Unknown, looked: None, runs: None }
+    }
+
+    /// Record a run (`runs.jsonl`) for every watched session that finishes,
+    /// not just ones opened in a view, so history builds while the inbox or
+    /// `notify` runs.
+    pub fn record_runs(mut self, rec: Recorder) -> Inbox {
+        self.runs = Some(rec);
+        self
     }
 
     /// Use this view of the running processes (tests, or a caller that
@@ -323,7 +336,7 @@ impl Inbox {
             }
             let mut live = Live::new(f.open(), String::new());
             live.refresh();
-            self.watched.push(Watched { found: f, live, state: State::Working });
+            self.watched.push(Watched { found: f, live, state: State::Working, recorded: None });
         }
     }
 
@@ -341,13 +354,15 @@ impl Inbox {
     /// is left out, unless it's still waiting on you or in error.
     pub fn entries(&mut self, pricing: &Pricing, now: i64, stuck_ms: i64, reviewed: &Reviewed) -> Vec<Entry> {
         let window = self.window.as_millis() as i64;
+        let pulses: Vec<Pulse> = self.watched.iter().map(|w| w.live.pulse(pricing, now)).collect();
+        self.record_finished(&pulses, pricing, now);
         let mut rows: Vec<(Entry, bool)> = self
             .watched
             .iter()
-            .map(|w| {
+            .zip(&pulses)
+            .map(|(w, p)| {
                 let dir = w.live.cwd().map(PathBuf::from).or_else(|| w.found.project_dir.clone());
-                let p = w.live.pulse(pricing, now);
-                let e = Entry::new(w.found.harness, w.live.session_id(), &w.found.path, dir, &p, now, stuck_ms, reviewed);
+                let e = Entry::new(w.found.harness, w.live.session_id(), &w.found.path, dir, p, now, stuck_ms, reviewed);
                 (e, !p.empty && now - p.last <= window)
             })
             .collect();
@@ -366,6 +381,39 @@ impl Inbox {
             .collect();
         sort(&mut v);
         v
+    }
+}
+
+impl Inbox {
+    /// Record the run of each watched session whose agents have all finished
+    /// and that has been quiet for [`runs::GRACE_MS`] (so the orchestrator's
+    /// wrap-up counts), once per finish: a session that resumes and finishes
+    /// again is recorded again. Built as of the session's own end, so the
+    /// same session always gives the same run (unchanged: not rewritten).
+    fn record_finished(&mut self, pulses: &[Pulse], pricing: &Pricing, now: i64) {
+        let Some(rec) = self.runs.as_mut() else {
+            return;
+        };
+        for (w, p) in self.watched.iter_mut().zip(pulses) {
+            if p.empty || p.running || now - p.last < runs::GRACE_MS || w.recorded == Some(p.last) {
+                continue;
+            }
+            w.recorded = Some(p.last);
+            let sess = w.live.build(pricing);
+            let Some(mut run) = runs::Run::from_session(&sess, runs::session_end(&sess)) else {
+                continue;
+            };
+            if run.project.is_empty() {
+                if let Some(dir) = w.live.cwd().map(PathBuf::from).or_else(|| w.found.project_dir.clone()) {
+                    run.project = dir.to_string_lossy().into_owned();
+                }
+            }
+            // the file it came from, so `profile` doesn't read it again
+            let when = discovery::activity(&Roots::here(), w.found.harness, &w.found.path);
+            run.src = w.found.path.to_string_lossy().into_owned();
+            run.src_mtime = when.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+            rec.record(run);
+        }
     }
 }
 
@@ -976,6 +1024,70 @@ mod tests {
         // 40 minutes on: a waiting session would still be listed; this one is gone
         ib.rescan_at(&roots, now + Duration::from_secs(40 * 60));
         assert!(ib.entries(&Pricing::default(), ms + 40 * 60_000, 120_000, &Reviewed::default()).is_empty());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The inbox (and `notify`, which drives the same watcher) records a
+    /// run for every session that finishes, opened in a view or not: once
+    /// its grace period is up, once per finish, and not again after a
+    /// restart when nothing changed. Running sessions aren't recorded.
+    #[test]
+    fn finished_sessions_are_recorded_without_a_view() {
+        use crate::adapters::claude::encode_path;
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("aflow-inbox-runs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let roots = Roots { claude: base.join("claude"), codex: base.join("codex") };
+        let runs_path = base.join("runs.jsonl");
+        let now = SystemTime::now();
+        let ms = now_ms();
+        let iso = |ago: i64| chrono::DateTime::from_timestamp_millis(ms - ago).unwrap().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let session = |dir: &str, id: &str, done_ago: i64, finished: bool| {
+            let path = roots.claude.join(encode_path(Path::new(dir))).join(format!("{id}.jsonl"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let reply = if finished {
+                r#"{"type":"text","text":"Done."}"#
+            } else {
+                r#"{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"cargo build"}}"#
+            };
+            let stop = if finished { "end_turn" } else { "tool_use" };
+            let lines = [
+                format!(r#"{{"type":"user","timestamp":"{}","cwd":"{dir}","message":{{"role":"user","content":"go"}}}}"#, iso(done_ago + 20_000)),
+                format!(r#"{{"type":"assistant","timestamp":"{}","cwd":"{dir}","message":{{"id":"m1","model":"claude-haiku-5-5","role":"assistant","stop_reason":"{stop}","content":[{reply}],"usage":{{"input_tokens":10,"output_tokens":5}}}}}}"#, iso(done_ago)),
+            ];
+            fs::write(&path, lines.join("\n") + "\n").unwrap();
+            path
+        };
+        let done = session("/work/done", "d-1", 60_000, true);
+        session("/work/fresh", "f-1", 5_000, true);
+        session("/work/busy", "b-1", 1_000, false);
+        let lines = || fs::read_to_string(&runs_path).map_or(0, |t| t.lines().count());
+        let watch = || {
+            let mut ib = Inbox::new(&[Harness::Claude], Duration::from_secs(30 * 60))
+                .record_runs(Recorder::new(runs_path.clone(), None));
+            ib.rescan_at(&roots, now);
+            ib
+        };
+        let entries = |ib: &mut Inbox, at: i64| ib.entries(&Pricing::default(), at, 0, &Reviewed::default());
+
+        let mut ib = watch();
+        entries(&mut ib, ms);
+        let st = runs::Store::load(&runs_path);
+        let ids: Vec<String> = st.runs.iter().map(runs::Run::id).collect();
+        assert_eq!(ids, ["claude:d-1"], "finished a minute ago; fresh is within its grace period; busy is running");
+        let r = st.get("claude:d-1").unwrap();
+        assert_eq!((r.project.as_str(), r.src.as_str(), r.agents.len()), ("/work/done", done.to_string_lossy().as_ref(), 1));
+        entries(&mut ib, ms + 1_000);
+        assert_eq!(lines(), 1, "once per finish");
+        entries(&mut ib, ms + 60_000);
+        assert_eq!(lines(), 2, "fresh's grace period is up");
+        let st = runs::Store::load(&runs_path);
+        assert!(st.get("claude:f-1").is_some() && st.get("claude:b-1").is_none());
+
+        // a restarted watcher (`notify` relaunched): nothing changed, nothing written
+        let mut ib = watch();
+        entries(&mut ib, ms + 60_000);
+        assert_eq!(lines(), 2);
         let _ = fs::remove_dir_all(&base);
     }
 

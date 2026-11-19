@@ -21,6 +21,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::discovery::Found;
 use crate::model::{Agent, Session};
 use crate::pricing::Pricing;
 use crate::schema::Harness;
@@ -280,6 +281,12 @@ impl Store {
         }
         self.lines += 1;
         if self.lines > 2 * self.runs.len() + 20 {
+            // another process (`notify`, a view) may have appended since this
+            // store was loaded: rewrite from the file, not from memory
+            let mut disk = Store::load(path);
+            disk.upsert(run);
+            disk.runs.sort_by_key(|r| r.started);
+            *self = disk;
             return self.compact(path);
         }
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
@@ -353,11 +360,19 @@ impl Recorder {
         }
     }
 
+    /// Write a finished session's run unless it's on record unchanged (the
+    /// inbox and `notify`, for every session that finishes).
+    pub fn record(&mut self, run: Run) {
+        self.write(run);
+    }
+
     fn write(&mut self, mut run: Run) {
         if let Some(old) = self.store.get(&run.id()) {
             // keep what indexing learned about the file, so it isn't re-read
-            run.src.clone_from(&old.src);
-            run.src_mtime = old.src_mtime;
+            if run.src.is_empty() {
+                run.src.clone_from(&old.src);
+                run.src_mtime = old.src_mtime;
+            }
             if run.workflow.is_none() {
                 run.workflow.clone_from(&old.workflow);
             }
@@ -372,6 +387,37 @@ impl Recorder {
 
 // ---- indexing finished sessions --------------------------------------------------
 
+fn epoch_ms(t: SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+/// Read a stored session from start to end and build its run, as of its last
+/// activity. `when` is that activity (the file's, subagents' included): it
+/// becomes `src_mtime`, so it isn't re-read until it changes. A session where
+/// nothing worked still gets a record (no agents), so it isn't re-read
+/// either. Reads only the harness's files.
+pub fn read_session(found: &Found, when: SystemTime, pricing: &Pricing) -> Run {
+    let mut live = crate::live::Live::new(found.open(), String::new());
+    // subagents can surface a poll after their parent names them
+    live.refresh();
+    live.refresh();
+    let sess = live.build(pricing);
+    let mut run = Run::from_session(&sess, session_end(&sess)).unwrap_or_else(|| Run {
+        v: VERSION,
+        harness: found.harness.name().to_string(),
+        session: sess.id.clone().unwrap_or_else(|| found.path.to_string_lossy().into_owned()),
+        ..Run::default()
+    });
+    if run.project.is_empty() {
+        if let Some(dir) = found.project_dir.as_deref().or(live.cwd().map(Path::new)) {
+            run.project = dir.to_string_lossy().into_owned();
+        }
+    }
+    run.src = found.path.to_string_lossy().into_owned();
+    run.src_mtime = epoch_ms(when);
+    run
+}
+
 /// Record every session of `project` (in `harnesses`) that has been quiet for
 /// [`crate::discovery::ACTIVE`] and isn't on record as of its latest activity.
 /// Reads the harnesses' files, writes only `path`, and only when `write`
@@ -379,36 +425,19 @@ impl Recorder {
 /// runs it added or updated.
 pub fn index(store: &mut Store, path: &Path, write: bool, harnesses: &[Harness], project: &Path, pricing: &Pricing) -> usize {
     let now = SystemTime::now();
-    let ms = |t: SystemTime| t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
     let seen: HashMap<&str, i64> =
         store.runs.iter().filter(|r| !r.src.is_empty()).map(|r| (r.src.as_str(), r.src_mtime)).collect();
     let todo: Vec<_> = crate::discovery::sessions(harnesses, project)
         .into_iter()
         .filter(|(_, when)| now.duration_since(*when).unwrap_or_default() >= crate::discovery::ACTIVE)
-        .filter(|(f, when)| seen.get(f.path.to_string_lossy().as_ref()) != Some(&ms(*when)))
+        .filter(|(f, when)| seen.get(f.path.to_string_lossy().as_ref()) != Some(&epoch_ms(*when)))
         .collect();
     if todo.len() > 20 {
         eprintln!("agentflow: indexing {} sessions…", todo.len());
     }
     let mut added = 0;
     for (found, when) in todo {
-        let mut live = crate::live::Live::new(found.open(), String::new());
-        // subagents can surface a poll after their parent names them
-        live.refresh();
-        live.refresh();
-        let sess = live.build(pricing);
-        let mut run = Run::from_session(&sess, session_end(&sess)).unwrap_or_else(|| Run {
-            // nothing worked in it: remember the file so it isn't re-read
-            v: VERSION,
-            harness: found.harness.name().to_string(),
-            session: sess.id.clone().unwrap_or_else(|| found.path.to_string_lossy().into_owned()),
-            ..Run::default()
-        });
-        if run.project.is_empty() {
-            run.project = project.to_string_lossy().into_owned();
-        }
-        run.src = found.path.to_string_lossy().into_owned();
-        run.src_mtime = ms(when);
+        let run = read_session(&found, when, pricing);
         if !write {
             store.upsert(run);
             added += 1;
@@ -417,6 +446,78 @@ pub fn index(store: &mut Store, path: &Path, write: bool, harnesses: &[Harness],
         }
     }
     added
+}
+
+// ---- importing every stored session ----------------------------------------------
+
+/// What [`import`] did.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Imported {
+    /// sessions found in the harnesses' storage
+    pub found: usize,
+    /// runs added (sessions with at least one agent)
+    pub runs: usize,
+    /// workflows those runs belong to
+    pub workflows: usize,
+    /// sessions skipped: already on record (by session id or file)
+    pub known: usize,
+    /// sessions skipped: active within [`crate::discovery::ACTIVE`], not
+    /// finished yet (recorded once they are)
+    pub running: usize,
+    /// sessions read where nothing worked (recorded without agents, so a
+    /// second import skips them)
+    pub empty: usize,
+}
+
+/// Backfill run history from every stored session in `sessions` (each with
+/// its latest activity): read each one that isn't on record yet and has gone
+/// quiet, and append its run to `path`. A session is on record when a run
+/// has its id (`claude:<id>`, from a watched view, the inbox or `notify`) or
+/// was indexed from its file, at any activity time: importing twice adds
+/// nothing. Reads the harnesses' files, writes only `path`. `progress(done,
+/// total)` is called before each session read and once at the end.
+pub fn import(
+    store: &mut Store,
+    path: &Path,
+    sessions: Vec<(Found, SystemTime)>,
+    now: SystemTime,
+    pricing: &Pricing,
+    rules: &BTreeMap<String, WorkflowRule>,
+    progress: &mut dyn FnMut(usize, usize),
+) -> std::io::Result<Imported> {
+    let mut out = Imported { found: sessions.len(), ..Imported::default() };
+    let ids: HashSet<String> = store.runs.iter().map(Run::id).collect();
+    let srcs: HashSet<&str> = store.runs.iter().filter(|r| !r.src.is_empty()).map(|r| r.src.as_str()).collect();
+    let mut todo = Vec::new();
+    for (found, when) in sessions {
+        // the adapter names the session from its file alone (nothing read yet)
+        let id = format!("{}:{}", found.harness.name(), found.open().session_id());
+        if ids.contains(&id) || srcs.contains(found.path.to_string_lossy().as_ref()) {
+            out.known += 1;
+        } else if now.duration_since(when).unwrap_or_default() < crate::discovery::ACTIVE {
+            out.running += 1;
+        } else {
+            todo.push((found, when));
+        }
+    }
+    // oldest first, so the file reads in the order things happened
+    todo.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.path.cmp(&b.0.path)));
+    let total = todo.len();
+    let mut added: Vec<Run> = Vec::new();
+    for (i, (found, when)) in todo.into_iter().enumerate() {
+        progress(i, total);
+        let run = read_session(&found, when, pricing);
+        if run.agents.is_empty() {
+            out.empty += 1;
+        } else {
+            added.push(run.clone());
+        }
+        store.append(path, run)?;
+    }
+    progress(total, total);
+    out.runs = added.len();
+    out.workflows = group(&added, rules).len();
+    Ok(out)
 }
 
 // ---- workflows ------------------------------------------------------------------
@@ -650,6 +751,120 @@ mod tests {
         assert_eq!(r.workflow.as_deref(), Some("pr-review"));
         assert!((r.cost - 0.22).abs() < 1e-9);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another process appending (`notify` running while a view records)
+    /// doesn't lose its runs when this store compacts the file.
+    #[test]
+    fn compaction_keeps_runs_another_process_appended() {
+        let dir = std::env::temp_dir().join(format!("aflow-compact-{}", std::process::id()));
+        let p = dir.join("runs.jsonl");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut mine = Store::load(&p);
+        let mut theirs = Store::load(&p);
+        theirs.append(&p, run("theirs", "/w", &["scout"], 5)).unwrap();
+        for i in 0..30 {
+            let mut r = run("mine", "/w", &["scout"], 1);
+            r.tool_calls = i;
+            mine.append(&p, r).unwrap();
+        }
+        let back = Store::load(&p);
+        assert!(std::fs::read_to_string(&p).unwrap().lines().count() < 25, "compacted");
+        assert!(back.get("claude:theirs").is_some(), "the other process's run survived");
+        assert_eq!(back.get("claude:mine").unwrap().tool_calls, 29);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `profile --import`: every harness's stored sessions in every project
+    /// become runs (a Codex subagent is part of its parent's run, not one of
+    /// its own); sessions on record (by id from a watched view, or by file),
+    /// still running, or where nothing worked aren't imported as runs; a
+    /// second import adds nothing.
+    #[test]
+    fn import_backfills_every_harness_and_skips_what_is_on_record() {
+        use crate::adapters::claude::encode_path;
+        use crate::discovery::{all_sessions_at, Roots};
+        use std::fs;
+        use std::time::Duration;
+
+        let base = std::env::temp_dir().join(format!("aflow-import-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let roots = Roots { claude: base.join("claude"), codex: base.join("codex") };
+        let p = base.join("agentflow").join("runs.jsonl");
+        let now = SystemTime::now();
+        let write = |path: &Path, text: &str, age_s: u64| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+            fs::File::options().write(true).open(path).unwrap().set_modified(now - Duration::from_secs(age_s)).unwrap();
+        };
+        let worked = |cwd: &str| {
+            [
+                format!(r#"{{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","cwd":"{cwd}","message":{{"role":"user","content":"run the tests"}}}}"#),
+                format!(r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:05.000Z","cwd":"{cwd}","message":{{"id":"m1","model":"claude-haiku-5-5","role":"assistant","stop_reason":"end_turn","content":[{{"type":"text","text":"All pass."}}],"usage":{{"input_tokens":10,"output_tokens":5}}}}}}"#),
+            ]
+            .join("\n")
+                + "\n"
+        };
+        let claude = |dir: &str, id: &str| roots.claude.join(encode_path(Path::new(dir))).join(format!("{id}.jsonl"));
+        let app = claude("/w/app", "c-app");
+        write(&app, &worked("/w/app"), 3_600);
+        write(&claude("/w/app", "c-app-2"), &worked("/w/app"), 7_200);
+        write(&claude("/w/app", "c-watched"), &worked("/w/app"), 3_600);
+        write(&claude("/w/app", "c-indexed"), &worked("/w/app"), 3_600);
+        write(&claude("/w/app", "c-empty"), "", 3_600);
+        write(&claude("/w/app", "c-running"), &worked("/w/app"), 10);
+        // a Codex parent and its subagent: one session
+        let day = roots.codex.join("2026").join("01").join("02");
+        let codex_s = day.join("rollout-2026-01-02T00-00-00-1111aaaa-0000-4000-8000-000000000001.jsonl");
+        write(&codex_s, include_str!("../tests/fixtures/codex/subagents/rollout-2026-01-02T00-00-00-1111aaaa-0000-4000-8000-000000000001.jsonl"), 3_600);
+        write(
+            &day.join("rollout-2026-01-02T00-00-01-1111aaaa-0000-4000-8000-000000000002.jsonl"),
+            include_str!("../tests/fixtures/codex/subagents/rollout-2026-01-02T00-00-01-1111aaaa-0000-4000-8000-000000000002.jsonl"),
+            3_600,
+        );
+
+        let sessions = all_sessions_at(&roots, crate::discovery::SUPPORTED);
+        assert_eq!(sessions.len(), 7, "six Claude sessions and one Codex session (its subagent isn't its own)");
+        assert_eq!(all_sessions_at(&roots, &[Harness::Codex]).len(), 1, "--source narrows");
+
+        // already on record: one recorded live (by id, no file), one indexed
+        // from its file under an earlier activity time
+        let mut store = Store::load(&p);
+        store.append(&p, run("c-watched", "/w/app", &["claude"], 1)).unwrap();
+        let mut indexed = run("c-indexed-old-id", "/w/app", &["claude"], 2);
+        indexed.src = claude("/w/app", "c-indexed").to_string_lossy().into_owned();
+        indexed.src_mtime = 1;
+        store.append(&p, indexed).unwrap();
+
+        let pricing = Pricing::default();
+        let rules = BTreeMap::new();
+        let mut ticks = Vec::new();
+        let got = import(&mut store, &p, sessions, now, &pricing, &rules, &mut |d, t| ticks.push((d, t))).unwrap();
+        assert_eq!(
+            got,
+            Imported { found: 7, runs: 3, workflows: 2, known: 2, running: 1, empty: 1 },
+            "both /w/app runs are one workflow; the Codex team in /w/team another"
+        );
+        assert_eq!(ticks, [(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)], "progress per session read, then done");
+        assert_eq!(fs::read_to_string(&p).unwrap().lines().count(), 6, "two on record + four read (the empty one too)");
+
+        let back = Store::load(&p);
+        let a = back.get("claude:c-app").unwrap();
+        assert_eq!((a.project.as_str(), a.src.as_str()), ("/w/app", app.to_string_lossy().as_ref()));
+        assert_eq!(a.agents.len(), 1);
+        let c = back.get("codex:1111aaaa-0000-4000-8000-000000000001").unwrap();
+        assert_eq!(c.project, "/w/team");
+        assert_eq!(c.src, codex_s.to_string_lossy());
+        assert_eq!(c.roles().into_iter().collect::<Vec<_>>(), ["scan"], "the subagent's role, from its own rollout");
+        assert!(back.get("claude:c-running").is_none(), "still running: not yet");
+        assert!(back.get("claude:c-empty").is_some_and(|r| r.agents.is_empty()), "remembered, so it isn't read again");
+
+        // importing again finds everything on record
+        let mut store = back;
+        let again = import(&mut store, &p, all_sessions_at(&roots, crate::discovery::SUPPORTED), now, &pricing, &rules, &mut |_, _| {}).unwrap();
+        assert_eq!(again, Imported { found: 7, known: 6, running: 1, ..Imported::default() });
+        assert_eq!(fs::read_to_string(&p).unwrap().lines().count(), 6, "nothing appended");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

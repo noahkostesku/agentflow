@@ -199,6 +199,11 @@ enum Cmd {
         /// Print the screen once and exit (also when stdout isn't a terminal).
         #[arg(long)]
         print: bool,
+        /// Backfill run history from every stored session of every
+        /// supported harness (all projects; narrow with --source), skipping
+        /// sessions already on record, then exit. Reads session files only.
+        #[arg(long, conflicts_with_all = ["demo", "print"])]
+        import: bool,
     },
     /// Two runs side by side: a number counts back from the latest run (1 =
     /// latest; within --workflow if given), anything else is a session id prefix.
@@ -341,6 +346,7 @@ fn main() -> io::Result<()> {
         };
         let wf = cli.workflow.as_deref();
         return match &cli.cmd {
+            Some(Cmd::Profile { import: true, .. }) => profile::run_import(&opts),
             Some(Cmd::Profile { last, print, .. }) => profile::run(&opts, wf, *last, *print),
             Some(Cmd::Compare { a, b, .. }) => profile::run_compare(&opts, a, b, wf).or_else(|why| {
                 eprintln!("agentflow: {why}");
@@ -977,8 +983,9 @@ fn run_live(term: &mut Term, mut watch: Watch, app: &mut App, back: bool) -> io:
     watch.record(&sess, &set.pricing, &mut app.persist);
 
     let exit = loop {
-        // With `inbox --notify`, keep watching every session from here too.
-        if let Some(w) = app.watcher.as_mut().filter(|w| w.notifying()) {
+        // Opened from the inbox: keep watching every session from here too
+        // (notifications with `--notify`, and run history either way).
+        if let Some(w) = app.watcher.as_mut() {
             w.tick(&tune, &app.reviewed);
         }
         // Every ~2s, look for a newer session (unless pinned).
@@ -1080,7 +1087,11 @@ impl App<'_> {
         }
         let set = self.set;
         if self.watcher.is_none() {
-            let ib = inbox::Inbox::new(&self.harnesses, Duration::from_secs(self.window_min * 60));
+            let mut ib = inbox::Inbox::new(&self.harnesses, Duration::from_secs(self.window_min * 60));
+            if set.cfg.persistence {
+                // every session that finishes, not just ones opened here
+                ib = ib.record_runs(runs::Recorder::new(runs::path(), None));
+            }
             let sink: Box<dyn notify::Sink> = Box::new(notify::Desktop);
             let notifier = self.notify.then(|| (notify::Notifier::new(&set.cfg.notify), sink));
             self.watcher = Some(notify::Watcher::new(ib, notifier));
@@ -1236,6 +1247,8 @@ fn run_notify(harnesses: &[Harness], set: &Settings, window_min: u64, dry_run: b
         }
     };
     let names: Vec<&str> = harnesses.iter().map(|h| h.name()).collect();
+    // every session that finishes goes into run history, as in the inbox
+    let ib = if set.cfg.persistence { ib.record_runs(runs::Recorder::new(runs::path(), None)) } else { ib };
     let mut w = notify::Watcher::new(ib, Some((notify::Notifier::new(&set.cfg.notify), sink)));
     writeln!(
         out,

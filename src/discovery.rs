@@ -202,6 +202,24 @@ pub fn sessions(harnesses: &[Harness], project: &Path) -> Vec<(Found, SystemTime
     out
 }
 
+/// Every stored top-level session in any project, in each of `harnesses`
+/// (in the given storage roots), with when it last showed signs of life
+/// (subagents included): what `agentflow profile --import` backfills.
+/// Subagents' own files are part of their parent's session, never listed.
+pub fn all_sessions_at(roots: &Roots, harnesses: &[Harness]) -> Vec<(Found, SystemTime)> {
+    let mut out = Vec::new();
+    for &harness in harnesses {
+        let found = match harness {
+            Harness::Claude => claude::active(&roots.claude, SystemTime::UNIX_EPOCH),
+            Harness::Codex => codex::active(&roots.codex, SystemTime::UNIX_EPOCH),
+        };
+        out.extend(
+            found.into_iter().map(|(path, when)| (Found { harness, path, project_dir: None, fell_back: false }, when)),
+        );
+    }
+    out
+}
+
 /// A `--project` argument as Claude Code would have recorded it: absolute,
 /// symlinks resolved (macOS `/tmp` → `/private/tmp`), no `.`/`..`, no
 /// trailing slash, `~` expanded. Falls back to a lexical cleanup when the

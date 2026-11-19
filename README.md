@@ -81,6 +81,8 @@ agentflow inbox              # every active session, any project: which one need
 agentflow inbox --notify     # the same, plus a desktop notification when one does
 agentflow notify             # just the notifications, no TUI (run it in the background)
 agentflow inbox --demo       # a scripted inbox, sessions in every state
+agentflow profile            # your workflows over time: which agent to fix
+agentflow compare 1 2        # the latest run against the one before, side by side
 agentflow wrapped            # your month with agents, as eight animated slides
 agentflow events --json      # the session as normalized JSON events, live
 ```
@@ -89,6 +91,7 @@ agentflow events --json      # the session as normalized JSON events, live
 |------|---------|
 | `--source <name>` | which harness to watch: `claude`, `codex`, or `all` for the mixed view (default: the most recently active session in any of them). `pi`, `opencode` and `gemini` are accepted but not built yet. |
 | `--demo` | replay the scripted demo session on a loop |
+| `--workflow <name>` | tag the runs recorded while watching as this workflow (see [Profiler](#profiler)) |
 | `--calm` | disable glitch, shimmer, and the finish wave (steady, low-motion) |
 | `--session <id>` | watch a specific session id (pins it: no auto-switch) |
 | `--project <path>` | watch the session for another directory (relative paths, `~`, symlinks and trailing slashes are resolved the way the harnesses record them) |
@@ -484,6 +487,59 @@ sessions (with `persistence` on). Sessions recorded before this version have no
 start time or per-agent detail, so they only count toward `--all` totals; sessions
 recorded before time saved existed are left out of it.
 
+## Profiler
+
+For people who design and rerun agent workflows (custom subagents,
+orchestration prompts) and want them faster and cheaper: is a workflow getting
+better or worse, and which agent should you fix?
+
+```sh
+agentflow profile                       # your workflows: runs, medians, trends
+agentflow profile --workflow pr-review  # straight to one workflow's detail
+agentflow profile --demo                # seeded history (12 runs, one regression)
+agentflow compare 1 2                   # the latest run against the one before
+agentflow compare 3f2a91c0 9be0d4e1     # two runs by id prefix, any harness
+agentflow compare 1 2 --workflow pr-review  # numbers count within a workflow
+```
+
+**Runs.** Every finished session becomes a run in `~/.agentflow/runs.jsonl`:
+project, harness, start, wall time (orchestrator included), total agent time,
+the critical path, peak and average concurrency, ≈cost and tokens per agent
+(role and model), tool calls, errors, and outcome (did the last test command
+pass, did any agent end in error or never report back). Live mode records a
+session 30s after its batch of agents finishes (so the orchestrator's wrap-up
+counts) and on exit; `profile` and `compare` also index the current project's
+sessions (`--project` for another) that have been quiet for 10 minutes and
+aren't on record yet. With `persistence` off nothing is recorded; `profile`
+then shows only what it indexes from the project's sessions.
+
+**Workflows.** Runs group by project plus the set of agent roles (a Codex
+subagent counts by its path, `repo_overview`, not its nickname). Name one, and
+group runs that sometimes add an extra agent, in the config:
+
+```toml
+[workflows.pr-review]
+roles = ["scout", "reviewer", "fixer"]   # runs with at least these roles
+project = "~/code/shop-api"              # optional
+```
+
+or tag runs as you watch: `agentflow --workflow pr-review`.
+
+**`profile`** lists workflows with their run count, median wall time, median
+≈cost and a braille trend of wall time. `↑`/`↓` and `Enter` open one: wall
+and cost trends over the last 20 runs (`--last N`), a ✓/✗ outcome strip, a
+per-role table (median time, ≈cost, model, share of runs on the critical
+path), recent runs with their ids, and up to three insights once there are 5
+runs, such as *"scout is on the critical path in 83% of runs"* or *"reviewer
+on opus costs 25× scout on haiku with similar duration"*. A role or the whole
+run more than 25% slower or costlier than its median over the previous 10 runs
+is flagged in amber (it needs 3 earlier runs, and ignores differences under 2s
+or half a cent). `--print` prints the screen once; piped output is plain text.
+
+**`compare`** puts two runs side by side: wall and agent time, cost, tokens,
+agents, concurrency, critical path, tool calls, outcome, then per role. It
+works across harnesses, such as the same task in Claude Code and in Codex.
+
 ## How it works
 
 agentflow is **read-only** toward every harness. It watches the session files
@@ -491,8 +547,9 @@ they already write (Claude Code's transcripts under `~/.claude/projects/`,
 Codex's rollouts under `~/.codex/sessions/`) and renders them at ~20fps. It
 installs no hooks, writes nothing to any harness's directories, and never
 touches your sessions. Its only writes are its own `~/.agentflow/config.toml`
-(created once), with `persistence` on `~/.agentflow/lifetime.json`, and the
-inbox's reviewed marks, `~/.agentflow/reviewed.json`.
+(created once), with `persistence` on `~/.agentflow/lifetime.json` and the
+profiler's run history `~/.agentflow/runs.jsonl`, and the inbox's reviewed
+marks, `~/.agentflow/reviewed.json`.
 
 Each harness has an **adapter** that translates its files into one normalized,
 versioned [event schema](docs/schema.md). Every view, stat and feature reads

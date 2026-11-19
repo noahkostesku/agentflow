@@ -1056,6 +1056,22 @@ pub fn active(root: &Path, since: SystemTime) -> Vec<(PathBuf, SystemTime)> {
     out
 }
 
+/// Every session stored for `project`, with when each last showed signs of
+/// life (subagents included). For indexing finished runs (`agentflow profile`).
+pub fn sessions(root: &Path, project: &Path) -> Vec<(PathBuf, SystemTime)> {
+    let Ok(rd) = std::fs::read_dir(project_dir(root, project)) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .map(|p| {
+            let when = activity(&p);
+            (p, when)
+        })
+        .collect()
+}
+
 /// The session for `session` anywhere; else `project`'s newest; else, with
 /// `fallback`, the most recently active session across all projects.
 pub fn find(root: &Path, session: Option<&str>, project: Option<&Path>, fallback: bool) -> Option<Resolved> {

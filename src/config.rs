@@ -2,12 +2,13 @@
 //! overrides. Created with commented-out defaults on first run; a missing or
 //! partial file falls back to the defaults below. CLI `--no-*` flags win.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::pricing::RatesOverride;
+use crate::runs::WorkflowRule;
 
 /// Default accent: dusty mauve.
 pub const DEFAULT_ACCENT: u32 = 0xc4a5b4;
@@ -39,6 +40,8 @@ pub struct Config {
     pub inbox: InboxConfig,
     /// desktop notifications (`agentflow notify`, `inbox --notify`)
     pub notify: NotifyConfig,
+    /// profiler: name the runs that have these roles (`[workflows.<name>]`)
+    pub workflows: BTreeMap<String, WorkflowRule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -116,6 +119,7 @@ impl Default for Config {
             pricing: HashMap::new(),
             inbox: InboxConfig::default(),
             notify: NotifyConfig::default(),
+            workflows: BTreeMap::new(),
         }
     }
 }
@@ -162,6 +166,14 @@ pub const DEFAULT_FILE: &str = r##"# agentflow config. Uncomment a line to chang
 #
 # [pricing."claude-sonnet-5-5"]
 # output = 10.0
+
+# Profiler (`agentflow profile`): runs group into workflows by project + the
+# set of agent roles. Name a workflow to group runs that have at least these
+# roles (optionally only in one project); `--workflow <name>` tags runs too.
+#
+# [workflows.pr-review]
+# roles = ["scout", "reviewer", "fixer"]
+# project = "~/code/shop-api"
 "##;
 
 /// `~/.agentflow`
@@ -275,6 +287,24 @@ mod tests {
         assert_eq!(cfg.pricing["opus"].input, Some(1.5));
         assert_eq!(cfg.pricing["opus"].output, None);
         assert_eq!(cfg.pricing["claude-haiku-5-5"].output, Some(0.75));
+    }
+
+    #[test]
+    fn workflow_rules() {
+        let cfg = Config::parse(
+            r#"
+            [workflows.pr-review]
+            roles = ["scout", "fixer"]
+            project = "~/code/app"
+            [workflows.nightly]
+            roles = ["auditor"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.workflows["pr-review"].roles, ["scout", "fixer"]);
+        assert_eq!(cfg.workflows["pr-review"].project.as_deref(), Some("~/code/app"));
+        assert_eq!(cfg.workflows["nightly"].project, None);
+        assert!(Config::parse("[workflows.x]\nrole = [\"a\"]").is_err(), "typos are reported");
     }
 
     #[test]

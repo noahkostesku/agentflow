@@ -185,6 +185,23 @@ pub fn newer(harnesses: &[Harness], project: &Path, fell_back: bool, current: (H
     (ahead >= std::time::Duration::from_secs(5)).then_some(cand)
 }
 
+/// Every stored session for `project` in each of `harnesses`, with when it
+/// last showed signs of life: what `agentflow profile` indexes as runs.
+pub fn sessions(harnesses: &[Harness], project: &Path) -> Vec<(Found, SystemTime)> {
+    let roots = Roots::here();
+    let mut out = Vec::new();
+    for &harness in harnesses {
+        let found = match harness {
+            Harness::Claude => claude::sessions(&roots.claude, project),
+            Harness::Codex => codex::sessions(&roots.codex, project),
+        };
+        out.extend(found.into_iter().map(|(path, when)| {
+            (Found { harness, path, project_dir: Some(project.to_path_buf()), fell_back: false }, when)
+        }));
+    }
+    out
+}
+
 /// A `--project` argument as Claude Code would have recorded it: absolute,
 /// symlinks resolved (macOS `/tmp` → `/private/tmp`), no `.`/`..`, no
 /// trailing slash, `~` expanded. Falls back to a lexical cleanup when the

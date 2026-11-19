@@ -16,7 +16,9 @@ mod notify;
 mod orbit;
 mod pricing;
 mod procs;
+mod profile;
 mod render;
+mod runs;
 mod schema;
 mod stats;
 mod theme;
@@ -75,6 +77,11 @@ struct Cli {
     /// Watch the session for a specific project path (default: cwd).
     #[arg(long, value_name = "PATH", global = true)]
     project: Option<String>,
+
+    /// Profiler: tag the runs recorded while watching as this workflow; with
+    /// `profile`, open it; with `compare`, count runs within it.
+    #[arg(long, value_name = "NAME", global = true)]
+    workflow: Option<String>,
 
     /// Turn off achievement popups (overrides config).
     #[arg(long)]
@@ -179,6 +186,30 @@ enum Cmd {
         /// Print every active session's state once and exit.
         #[arg(long)]
         once: bool,
+    },
+    /// Profile your workflows from run history: trends, per-role breakdown,
+    /// regressions and insights (↑/↓ select, enter detail, esc back, q quit).
+    Profile {
+        /// Show seeded demo history instead of yours.
+        #[arg(long)]
+        demo: bool,
+        /// How many recent runs the detail view covers.
+        #[arg(long, value_name = "N", default_value_t = profile::DEFAULT_LAST)]
+        last: usize,
+        /// Print the screen once and exit (also when stdout isn't a terminal).
+        #[arg(long)]
+        print: bool,
+    },
+    /// Two runs side by side: a number counts back from the latest run (1 =
+    /// latest; within --workflow if given), anything else is a session id prefix.
+    Compare {
+        #[arg(value_name = "RUN_A")]
+        a: String,
+        #[arg(value_name = "RUN_B")]
+        b: String,
+        /// Compare seeded demo runs instead of yours.
+        #[arg(long)]
+        demo: bool,
     },
     /// Your agents, wrapped: eight animated slides from your lifetime history
     /// (space / → next, ← back, q quit).
@@ -299,6 +330,25 @@ fn main() -> io::Result<()> {
         }
         return run_events(found.iter().map(discovery::Found::open).collect(), *once);
     }
+    if let Some(Cmd::Profile { demo, .. } | Cmd::Compare { demo, .. }) = &cli.cmd {
+        let opts = profile::Opts {
+            rules: &set.cfg.workflows,
+            pricing: &set.pricing,
+            project: cwd.clone(),
+            harnesses: harnesses.clone(),
+            demo: *demo || cli.demo,
+            persist: set.cfg.persistence,
+        };
+        let wf = cli.workflow.as_deref();
+        return match &cli.cmd {
+            Some(Cmd::Profile { last, print, .. }) => profile::run(&opts, wf, *last, *print),
+            Some(Cmd::Compare { a, b, .. }) => profile::run_compare(&opts, a, b, wf).or_else(|why| {
+                eprintln!("agentflow: {why}");
+                std::process::exit(2)
+            }),
+            _ => Ok(()),
+        };
+    }
 
     let window_min = match &cli.cmd {
         Some(Cmd::Inbox { active: Some(m), .. } | Cmd::Notify { active: Some(m), .. }) => *m,
@@ -338,7 +388,13 @@ fn main() -> io::Result<()> {
     let mut app = App {
         set: &set,
         calm: cli.calm,
-        persist: Persist { on: set.cfg.persistence, totals: store.totals(), store, dirty: false },
+        persist: Persist {
+            on: set.cfg.persistence,
+            totals: store.totals(),
+            store,
+            dirty: false,
+            runs: runs::Recorder::new(runs::path(), cli.workflow.clone()),
+        },
         demo: cli.demo,
         harnesses: harnesses.clone(),
         window_min,
@@ -814,11 +870,17 @@ struct Persist {
     store: lifetime::Store,
     totals: lifetime::Totals,
     dirty: bool,
+    /// run history for the profiler (`runs.rs`)
+    runs: runs::Recorder,
 }
 
 impl Persist {
     fn update(&mut self, sess: &model::Session, t: i64) {
-        if !self.on || !self.store.record(sess, t) {
+        if !self.on {
+            return;
+        }
+        self.runs.update(sess, t);
+        if !self.store.record(sess, t) {
             return;
         }
         self.totals = self.store.totals();
@@ -832,6 +894,14 @@ impl Persist {
             // Best effort: a read-only home just means no lifetime file.
             let _ = self.store.save(&lifetime::path());
             self.dirty = false;
+        }
+    }
+    /// Leaving a session (exit, switch, back to the inbox): write everything,
+    /// finished runs too.
+    fn close(&mut self) {
+        self.flush();
+        if self.on {
+            self.runs.flush();
         }
     }
 }
@@ -915,7 +985,7 @@ fn run_live(term: &mut Term, mut watch: Watch, app: &mut App, back: bool) -> io:
         if last_scan.elapsed() >= Duration::from_secs(2) {
             last_scan = Instant::now();
             if watch.rescan() {
-                app.persist.flush();
+                app.persist.close();
                 sess = watch.build(&set.pricing);
                 app_start = Instant::now(); // replay the header intro
                 ui.selected = None;
@@ -947,7 +1017,7 @@ fn run_live(term: &mut Term, mut watch: Watch, app: &mut App, back: bool) -> io:
         }
     };
 
-    app.persist.flush();
+    app.persist.close();
     app.calm = ui.calm;
     Ok(exit)
 }
@@ -1076,7 +1146,7 @@ fn run_app(start: Start, app: &mut App) -> io::Result<()> {
             }
         }
     })();
-    app.persist.flush();
+    app.persist.close();
     leave(&mut term)?;
     res
 }

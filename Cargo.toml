@@ -1,8 +1,16 @@
 [package]
 name = "agentflow"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "One live view of every coding agent you run: a terminal visualizer for Claude Code, Codex and other agent harnesses"
+license = "MIT"
+repository = "https://github.com/noahkostesku/agentflow"
+homepage = "https://github.com/noahkostesku/agentflow"
+readme = "README.md"
+keywords = ["claude-code", "codex", "tui", "agents", "observability"]
+categories = ["command-line-utilities", "development-tools", "visualization"]
+# the demo gif (2.4 MB) and release tooling stay on GitHub, out of the crate
+exclude = ["agent-flow-vid.gif", ".github/", "dist-workspace.toml"]
 
 [[bin]]
 name = "agentflow"
@@ -22,3 +30,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 opt-level = 3
 lto = true
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -30,17 +30,38 @@ renders wrong, please open an issue with the version. To add a harness, see
 
 ## Install
 
+Prebuilt binaries are available for macOS (Apple silicon and Intel) and Linux
+(x86_64 and arm64). You'll want a truecolor terminal.
+
+**Homebrew** (macOS, Linux):
+
 ```sh
-cargo install --git https://github.com/noahkostesku/agentflow
+brew install noahkostesku/tap/agentflow
 ```
 
-Or from source (needs Rust and a truecolor terminal):
+**Shell installer** (macOS, Linux): downloads the right binary from the latest
+[GitHub release](https://github.com/noahkostesku/agentflow/releases) into
+`~/.cargo/bin`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/noahkostesku/agentflow/releases/latest/download/agentflow-installer.sh | sh
+```
+
+**Cargo** (builds it; needs [Rust](https://rustup.rs)):
+
+```sh
+cargo install --locked --git https://github.com/noahkostesku/agentflow
+```
+
+**From source**:
 
 ```sh
 git clone https://github.com/noahkostesku/agentflow
 cd agentflow
 cargo build --release      # -> target/release/agentflow
 ```
+
+Then run `agentflow` in any project where you use Claude Code or Codex.
 
 Optional alias so it runs anywhere:
 

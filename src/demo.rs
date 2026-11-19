@@ -15,7 +15,7 @@ use crate::theme;
 pub const VALIDATORS: [&str; 2] = ["test-runner", "reviewer"];
 
 /// Loop length: everything is done by 13.3s, the recap shows at 14.8s; the
-/// rest leaves room for demo.tape to tour the views before it wraps.
+/// rest leaves room to tour the views before it wraps.
 const LENGTH: i64 = 20_000;
 
 /// Build the demo session. `header` is the full header string, derived from

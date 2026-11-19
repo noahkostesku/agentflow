@@ -2,7 +2,7 @@
 
 A cute cyberpunk terminal visualizer for Claude Code multi-agent sessions — little agents boot up, show faces, pass glowing data packets, and celebrate when they finish.
 
-![agentflow demo](demo.gif)
+![agentflow demo](agent-flow-vid.gif)
 
 ## Install
 

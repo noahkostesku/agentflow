@@ -974,6 +974,70 @@ pub fn run(o: &Opts, workflow: Option<&str>, last: usize, print: bool) -> io::Re
     res
 }
 
+/// `agentflow profile --import`: backfill run history from every stored
+/// session of the chosen harnesses, any project. A progress line on stderr
+/// (when it's a terminal), then a summary.
+pub fn run_import(o: &Opts) -> io::Result<()> {
+    if !o.persist {
+        eprintln!("agentflow: persistence is off in the config, so there's no run history to import into");
+        std::process::exit(2);
+    }
+    let path = runs::path();
+    let mut store = runs::Store::load(&path);
+    let roots = crate::discovery::Roots::here();
+    let sessions = crate::discovery::all_sessions_at(&roots, &o.harnesses);
+    let tty = io::stderr().is_terminal();
+    let mut progress = |done: usize, total: usize| {
+        if tty && total > 0 {
+            eprint!("\r\x1b[2Kagentflow: importing {done}/{total} sessions…");
+            if done == total {
+                eprint!("\r\x1b[2K");
+            }
+        }
+    };
+    let res = runs::import(&mut store, &path, sessions, std::time::SystemTime::now(), o.pricing, o.rules, &mut progress);
+    let got = match res {
+        Ok(got) => got,
+        Err(e) => {
+            if tty {
+                eprintln!();
+            }
+            eprintln!("agentflow: couldn't write {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    };
+    for line in import_summary(&got) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// "imported 87 runs across 12 workflows", then what was skipped.
+pub fn import_summary(got: &runs::Imported) -> Vec<String> {
+    let n = |k: usize, one: &str, many: &str| format!("{k} {}", if k == 1 { one } else { many });
+    let mut out = vec![format!(
+        "imported {} across {}",
+        n(got.runs, "run", "runs"),
+        n(got.workflows, "workflow", "workflows")
+    )];
+    let skipped: Vec<String> = [
+        (got.known, "already recorded"),
+        (got.running, "still running"),
+        (got.empty, "with no agent work"),
+    ]
+    .into_iter()
+    .filter(|(k, _)| *k > 0)
+    .map(|(k, why)| format!("{k} {why}"))
+    .collect();
+    if !skipped.is_empty() {
+        out.push(format!("skipped {} of {}: {}", got.known + got.running + got.empty, n(got.found, "session", "sessions"), skipped.join(" · ")));
+    }
+    if got.runs > 0 {
+        out.push("see them with `agentflow profile`".into());
+    }
+    out
+}
+
 /// `agentflow compare <a> <b>`: numbers count back from the latest run (of
 /// `workflow`, when given).
 pub fn run_compare(o: &Opts, a: &str, b: &str, workflow: Option<&str>) -> Result<(), String> {
@@ -1267,6 +1331,23 @@ mod tests {
         assert_eq!(braille_trend(&[90.0, 100.0]), "⣾");
         let flagged = trend(&[1.0, 1.0, 1.0, 9.0], &[false, false, false, true], G);
         assert_eq!((flagged[0].style.fg, flagged[1].style.fg), (Some(G), Some(AM)));
+    }
+
+    #[test]
+    fn import_summary_counts_runs_workflows_and_skips() {
+        let got = runs::Imported { found: 120, runs: 87, workflows: 12, known: 20, running: 2, empty: 11 };
+        assert_eq!(
+            import_summary(&got),
+            [
+                "imported 87 runs across 12 workflows",
+                "skipped 33 of 120 sessions: 20 already recorded · 2 still running · 11 with no agent work",
+                "see them with `agentflow profile`",
+            ]
+        );
+        let one = runs::Imported { found: 1, runs: 1, workflows: 1, ..runs::Imported::default() };
+        assert_eq!(import_summary(&one), ["imported 1 run across 1 workflow", "see them with `agentflow profile`"]);
+        let none = runs::Imported { found: 3, known: 3, ..runs::Imported::default() };
+        assert_eq!(import_summary(&none), ["imported 0 runs across 0 workflows", "skipped 3 of 3 sessions: 3 already recorded"]);
     }
 
     #[test]

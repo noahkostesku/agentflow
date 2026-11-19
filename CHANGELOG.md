@@ -6,6 +6,26 @@ All notable changes to agentflow. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `agentflow profile --import` backfills run history from every stored
+  session of every supported harness, in all projects (`--source` narrows it).
+  It only reads session files, skips sessions already on record (by session
+  id or source file) and ones still running, shows a progress line, and ends
+  with a summary: "imported 87 runs across 12 workflows".
+
+### Changed
+
+- `agentflow notify` and the inbox record a run for every session that
+  finishes, not just sessions opened in a view, so history builds without a
+  view open. The inbox keeps doing this while you're in a session you opened
+  from it.
+
+### Fixed
+
+- Compacting `runs.jsonl` now starts from the file on disk, so runs another
+  agentflow process appended since this one loaded aren't dropped.
+
 ## [0.3.0] - 2026-11-19
 
 Two new ways to look across sessions instead of at one. The inbox answers

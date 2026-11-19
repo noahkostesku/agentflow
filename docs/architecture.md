@@ -37,7 +37,7 @@ Only the schema.
 | processes | `src/procs.rs` | `ps`, `lsof` / `/proc` | which `claude` / `codex` processes run where (closed sessions) |
 | durations | `src/duration.rs` | | the one duration format (`42s`, `17m 55s`, `1h 02m`) |
 | consumers | `render.rs`, `orbit.rs`, `stats.rs`, `lifetime.rs`, `wrapped.rs` | `model::Session` only | frames, stats, lifetime history |
-| profiler | `runs.rs`, `profile.rs` | `model::Session` only (live, or indexed from finished sessions) | run history (`runs.jsonl`), `profile`, `compare` |
+| profiler | `runs.rs`, `profile.rs` | `model::Session` only (live, the inbox's watcher, or indexed/imported from finished sessions) | run history (`runs.jsonl`), `profile`, `compare` |
 
 `SourceAdapter::poll()` returns whatever is new on disk as events. The live
 loop calls it about three times a second and folds the events into the

@@ -210,10 +210,6 @@ impl Watcher {
         }
         notes
     }
-
-    pub fn notifying(&self) -> bool {
-        self.notify.is_some()
-    }
 }
 
 #[cfg(test)]

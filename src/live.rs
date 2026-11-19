@@ -523,6 +523,7 @@ impl Live {
             solo: !orchestrated,
             harness: Some(self.harness.unwrap_or_else(|| self.src.harness())),
             groups: Vec::new(),
+            project: self.cwd.clone(),
         }
     }
 

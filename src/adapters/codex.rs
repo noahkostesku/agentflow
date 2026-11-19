@@ -876,6 +876,45 @@ pub fn read_cwd(path: &Path) -> Option<PathBuf> {
     head(path)?.pointer("/payload/cwd").and_then(Value::as_str).map(PathBuf::from)
 }
 
+/// Every top-level session that ran in `project`, with when it last showed
+/// signs of life (its subagents' rollouts, at any depth, included). For
+/// indexing finished runs (`agentflow profile`).
+pub fn sessions(root: &Path, project: &Path) -> Vec<(PathBuf, SystemTime)> {
+    let want = project.to_string_lossy().trim_end_matches('/').to_string();
+    // thread id -> (parent id for a subagent, rollout, mtime, ran in project)
+    let mut threads: HashMap<String, (Option<String>, PathBuf, SystemTime, bool)> = HashMap::new();
+    for (p, m) in rollouts(root) {
+        let Some(meta) = head(&p) else {
+            continue;
+        };
+        let here = meta.pointer("/payload/cwd").and_then(Value::as_str).map(|c| c.trim_end_matches('/')) == Some(&want);
+        match child_of(&meta) {
+            Some(c) => threads.insert(c.id, (Some(c.parent), p, m, here)),
+            None => threads.insert(session_id_of(&p), (None, p, m, here)),
+        };
+    }
+    let top = |id: &str| {
+        let mut id = id.to_string();
+        for _ in 0..64 {
+            match threads.get(&id) {
+                Some((Some(parent), ..)) => id = parent.clone(),
+                _ => break,
+            }
+        }
+        id
+    };
+    let mut newest: HashMap<String, SystemTime> = HashMap::new();
+    for (id, (_, _, m, _)) in &threads {
+        let e = newest.entry(top(id)).or_insert(*m);
+        *e = (*e).max(*m);
+    }
+    threads
+        .iter()
+        .filter(|(_, (parent, _, _, here))| parent.is_none() && *here)
+        .map(|(id, (_, p, m, _))| (p.clone(), newest.get(id).copied().unwrap_or(*m)))
+        .collect()
+}
+
 /// When a session last showed signs of life: its rollout or any of its
 /// subagents' (at any depth).
 pub fn activity(root: &Path, path: &Path) -> SystemTime {

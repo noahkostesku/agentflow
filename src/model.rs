@@ -233,6 +233,9 @@ pub struct Session {
     /// the harness it came from (live and recorded sessions; `None` for a
     /// mixed view, which spans several)
     pub harness: Option<Harness>,
+    /// the project directory the session ran in (live sessions), for run
+    /// history (`runs.rs`)
+    pub project: Option<String>,
     /// mixed view (`--source all`): one group per harness, each with its own
     /// root. `agents`, `orch_calls`, `events` and `handoffs` are then every
     /// group's, concatenated in group order. Empty for a single session.

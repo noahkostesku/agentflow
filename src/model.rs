@@ -3,6 +3,8 @@
 
 use ratatui::style::Color;
 
+use crate::schema::Harness;
+
 /// How an agent's current tool reads on its face.
 /// `Look` = reading/searching (eyes glance side to side).
 /// `Run`  = running a command (wide-eyed).
@@ -228,6 +230,34 @@ pub struct Session {
     /// one agent working for the user (a harness without subagents): the
     /// root of the tree is "you", not an orchestrator
     pub solo: bool,
+    /// the harness it came from (live and recorded sessions; `None` for a
+    /// mixed view, which spans several)
+    pub harness: Option<Harness>,
+    /// mixed view (`--source all`): one group per harness, each with its own
+    /// root. `agents`, `orch_calls`, `events` and `handoffs` are then every
+    /// group's, concatenated in group order. Empty for a single session.
+    pub groups: Vec<Group>,
+}
+
+/// One harness's part of a mixed view.
+pub struct Group {
+    /// harness name ("claude", "codex"), the group's dim label
+    pub harness: String,
+    /// index of its first agent in the mixed `Session::agents`
+    pub start: usize,
+    /// its session alone, on the mixed view's clock
+    pub sess: Session,
+}
+
+impl Group {
+    /// Its agents' indexes in the mixed session.
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.start..self.start + self.sess.agents.len()
+    }
+    /// A mixed-session agent index as an index into this group's session.
+    pub fn local(&self, i: Option<usize>) -> Option<usize> {
+        i.filter(|i| self.range().contains(i)).map(|i| i - self.start)
+    }
 }
 
 impl Session {
@@ -251,6 +281,14 @@ impl Session {
             .iter()
             .chain(self.agents.iter().flat_map(|a| a.calls.iter()))
             .filter(move |c| c.time <= t)
+    }
+    /// A mixed view of several harnesses' sessions.
+    pub fn mixed(&self) -> bool {
+        !self.groups.is_empty()
+    }
+    /// The group an agent belongs to (mixed view only).
+    pub fn group_of(&self, i: usize) -> Option<&Group> {
+        self.groups.iter().find(|g| g.range().contains(&i))
     }
     /// Elapsed-time multiplier: the demo runs ×3 for liveliness.
     pub fn scale(&self) -> f64 {

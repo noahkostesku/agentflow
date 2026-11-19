@@ -4,6 +4,9 @@
 //!   2. the project's (`--project`, default cwd) most recently active session
 //!      in any of the chosen harnesses.
 //!   3. fallback: the most recently active session anywhere.
+//!
+//! The mixed view (`--source all`) watches one session per harness instead:
+//! see [`find_mixed`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -102,6 +105,43 @@ pub fn find_at(roots: &Roots, harnesses: &[Harness], session: Option<&str>, proj
     newest(anywhere)
 }
 
+/// A session counts as active (for the mixed view) if it showed signs of life
+/// this recently.
+pub const ACTIVE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The sessions for a mixed view: each harness's most recently active
+/// session for `project`, keeping only the ones active right now (see
+/// [`ACTIVE`]); when none is, each harness's most recent. With no sessions
+/// for the project in any harness, the same rule over every project (all
+/// marked `fell_back`). In `harnesses` order, at most one per harness.
+pub fn find_mixed(harnesses: &[Harness], project: &Path) -> Vec<Found> {
+    find_mixed_at(&Roots::here(), harnesses, project, SystemTime::now())
+}
+
+/// [`find_mixed`] in the given storage roots, as of `now`.
+pub fn find_mixed_at(roots: &Roots, harnesses: &[Harness], project: &Path, now: SystemTime) -> Vec<Found> {
+    let pick = |found: Vec<Found>| -> Vec<Found> {
+        let active = |f: &Found| {
+            now.duration_since(activity(roots, f.harness, &f.path)).unwrap_or_default() <= ACTIVE
+        };
+        if found.iter().any(active) {
+            found.into_iter().filter(active).collect()
+        } else {
+            found
+        }
+    };
+    let here: Vec<Found> = harnesses.iter().filter_map(|&h| find_in(roots, h, None, Some(project), false)).collect();
+    if !here.is_empty() {
+        return pick(here);
+    }
+    let anywhere: Vec<Found> = harnesses
+        .iter()
+        .filter_map(|&h| find_in(roots, h, None, None, true))
+        .map(|f| Found { fell_back: true, ..f })
+        .collect();
+    pick(anywhere)
+}
+
 /// A session that has become newer than the one being watched, to switch
 /// to. Started in a directory with sessions: only that directory's sessions
 /// are candidates. Started on the global fallback: a session appearing in
@@ -194,6 +234,57 @@ mod tests {
 
         let f = find_at(&roots, all, None, Some(Path::new("/work/elsewhere"))).unwrap();
         assert!(f.fell_back && f.harness == Harness::Codex, "newest anywhere");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The mixed view: one session per harness for the project, only the
+    /// active ones while any is, else each harness's most recent; a project
+    /// with none falls back to every project.
+    #[test]
+    fn mixed_discovery_picks_one_session_per_harness() {
+        let base = std::env::temp_dir().join(format!("aflow-mixed-{}", std::process::id()));
+        let roots = Roots { claude: base.join("claude"), codex: base.join("codex") };
+        let project = PathBuf::from("/work/mixed");
+        let pdir = roots.claude.join(encode_path(&project));
+        let (c_old, c_new) = (pdir.join("c-old.jsonl"), pdir.join("c-new.jsonl"));
+        let day = roots.codex.join("2026").join("01").join("01");
+        let codex_s = day.join("rollout-2026-01-01T00-00-00-0000cccc-1111-2222-3333-444455556666.jsonl");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::create_dir_all(&day).unwrap();
+        for p in [&c_old, &c_new] {
+            fs::write(p, "").unwrap();
+        }
+        fs::write(&codex_s, r#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"id":"0000cccc-1111-2222-3333-444455556666","cwd":"/work/mixed"}}"#.to_string() + "\n").unwrap();
+        let now = SystemTime::now();
+        let age = |p: &Path, secs: u64| {
+            let t = now - std::time::Duration::from_secs(secs);
+            fs::File::options().write(true).open(p).unwrap().set_modified(t).unwrap();
+        };
+        let found = |roots: &Roots, project: &Path| -> Vec<(Harness, PathBuf, bool)> {
+            find_mixed_at(roots, SUPPORTED, project, now).into_iter().map(|f| (f.harness, f.path, f.fell_back)).collect()
+        };
+
+        // both running: both, claude's newest session, in harness order
+        age(&c_old, 120);
+        age(&c_new, 5);
+        age(&codex_s, 30);
+        assert_eq!(
+            found(&roots, &project),
+            [(Harness::Claude, c_new.clone(), false), (Harness::Codex, codex_s.clone(), false)]
+        );
+        // codex went quiet an hour ago: only the active claude session
+        age(&codex_s, 3_600);
+        assert_eq!(found(&roots, &project), [(Harness::Claude, c_new.clone(), false)]);
+        // nothing active: each harness's most recent
+        age(&c_new, 7_200);
+        age(&c_old, 9_000);
+        assert_eq!(found(&roots, &project).len(), 2);
+        // `--source claude` style narrowing still applies
+        assert_eq!(find_mixed_at(&roots, &[Harness::Codex], &project, now).len(), 1);
+        // no sessions for this project: every project's, marked as a fallback
+        let elsewhere = found(&roots, Path::new("/work/none"));
+        assert_eq!(elsewhere.len(), 2);
+        assert!(elsewhere.iter().all(|f| f.2));
         let _ = fs::remove_dir_all(&base);
     }
 

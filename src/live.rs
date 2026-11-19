@@ -262,9 +262,14 @@ impl Live {
         self.accs.get_mut(id).expect("inserted above")
     }
 
-    /// Build the render model for the current instant.
+    /// Build the render model for the current instant, on its own clock.
     pub fn build(&self, pricing: &Pricing) -> Session {
-        // `main` is a row only when it's the one working agent
+        self.build_at(pricing, self.origin().unwrap_or_else(now_ms))
+    }
+
+    /// Build the render model with session time 0 at epoch ms `t0` (a mixed
+    /// view puts every harness's session on one clock).
+    pub fn build_at(&self, pricing: &Pricing, t0: i64) -> Session {
         // `main` is the working row until a subagent spawns; from then on
         // it's the orchestrator above them
         let orchestrated = self.orchestrated();
@@ -275,7 +280,6 @@ impl Live {
         let root = self.cwd.as_deref().map(|c| c.trim_end_matches('/').to_string() + "/");
 
         let now = now_ms();
-        let t0 = self.origin().unwrap_or(now);
         let boss = if orchestrated { "orchestrator" } else { "you" };
 
         let mut agents = Vec::new();
@@ -467,6 +471,8 @@ impl Live {
             handoffs,
             unpriced,
             solo: !orchestrated,
+            harness: Some(self.harness.unwrap_or_else(|| self.src.harness())),
+            groups: Vec::new(),
         }
     }
 
@@ -475,8 +481,8 @@ impl Live {
         self.accs.keys().any(|k| k != MAIN)
     }
 
-    /// Earliest spawn we know about.
-    fn origin(&self) -> Option<i64> {
+    /// Earliest spawn we know about (epoch ms).
+    pub fn origin(&self) -> Option<i64> {
         let orchestrated = self.orchestrated();
         self.accs
             .iter()
@@ -489,6 +495,11 @@ impl Live {
     /// started watching if nothing has spawned yet (keeps the face alive).
     pub fn clock(&self) -> i64 {
         now_ms() - self.origin().unwrap_or(self.opened)
+    }
+
+    /// When we started watching (epoch ms).
+    pub fn opened(&self) -> i64 {
+        self.opened
     }
 }
 

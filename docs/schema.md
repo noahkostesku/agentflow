@@ -24,6 +24,11 @@ these fields, plus the fields of its `type`:
 | `ts`      | integer | epoch milliseconds when it happened, as the harness recorded it |
 | `type`    | string  | one of the event types below |
 
+`agentflow events --json --source all` interleaves several sessions' events
+(one per harness); `harness` and `session` tell them apart, and the ordering
+rules below hold within each session. Adding a harness adds a `harness`
+value; see [adapters.md](adapters.md).
+
 Fields that are empty, `false`, or absent are omitted when serializing.
 Readers must ignore fields they don't know: new optional fields can appear
 within v1. Removing a field or changing its meaning bumps `v`.

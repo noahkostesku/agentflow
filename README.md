@@ -1,8 +1,32 @@
 # agentflow
 
-A cute cyberpunk terminal visualizer for Claude Code multi-agent sessions — little agents boot up, show faces, pass glowing data packets, and celebrate when they finish.
+**One live view of every coding agent you run.**
+
+agentflow is a full-screen terminal visualizer for coding-agent sessions:
+Claude Code, Codex CLI, and more to come. Little agents boot up, show faces,
+pass glowing data packets to each other, and celebrate when they finish. Run
+Claude Code and Codex in the same repo and `--source all` shows both side by
+side, on one clock, with one cost total.
+
+It only reads the session files each harness already writes. Nothing to
+install into your agents, no hooks, no proxy.
 
 ![agentflow demo](agent-flow-vid.gif)
+
+## Supported harnesses
+
+| harness | status | sessions read from |
+|---------|--------|--------------------|
+| Claude Code | verified on 2.1.328, subagents and agent teams included | `~/.claude/projects/` |
+| Codex CLI | verified on 0.170.0, subagents included | `$CODEX_HOME/sessions/` (default `~/.codex/sessions/`) |
+| pi | planned | `~/.pi/agent/sessions/` |
+| opencode | planned | `~/.local/share/opencode/opencode.db` |
+| Gemini CLI | planned | |
+
+"Verified" means checked against real sessions from that version, not only
+synthetic fixtures. Formats change between releases; if a newer version
+renders wrong, please open an issue with the version. To add a harness, see
+[docs/adapters.md](docs/adapters.md).
 
 ## Install
 
@@ -27,17 +51,22 @@ echo 'alias aflow="agentflow"' >> ~/.zshrc && source ~/.zshrc
 ## Usage
 
 ```sh
-agentflow            # live: watch the session for the current directory
-agentflow --demo     # looping scripted demo (no session needed)
-agentflow wrapped    # your month with agents, as seven animated slides
+agentflow                    # live: the newest session for this directory, any harness
+agentflow --source codex     # only Codex sessions
+agentflow --source all       # every harness's session for this directory, together
+agentflow --demo             # looping scripted demo (no session needed)
+agentflow --demo --source all  # the demo with Claude Code and Codex side by side
+agentflow wrapped            # your month with agents, as eight animated slides
+agentflow events --json      # the session as normalized JSON events, live
 ```
 
 | flag | meaning |
 |------|---------|
+| `--source <name>` | which harness to watch: `claude`, `codex`, or `all` for the mixed view (default: the most recently active session in any of them). `pi`, `opencode` and `gemini` are accepted but not built yet. |
 | `--demo` | replay the scripted demo session on a loop |
 | `--calm` | disable glitch, shimmer, and the finish wave (steady, low-motion) |
 | `--session <id>` | watch a specific session id (pins it: no auto-switch) |
-| `--project <path>` | watch the session for another directory (relative paths, `~`, symlinks and trailing slashes are resolved the way Claude Code names its project dirs) |
+| `--project <path>` | watch the session for another directory (relative paths, `~`, symlinks and trailing slashes are resolved the way the harnesses record them) |
 | `--no-cost` | hide the cost column, header total, and `+$` flashes |
 | `--no-achievements` | no achievement popups |
 | `--no-recap` | no recap card at the end |
@@ -68,10 +97,38 @@ detail view) open over the current view, and `Esc` returns to it.
   `↑`/`↓` and `Enter` work here too.
 - **timeline**: swimlanes across the whole session (also on `t`; see below).
 
+### Mixed view: `--source all`
+
+Every harness's session for the project, together, for when you have Claude
+Code and Codex working in the same repo at once:
+
+- **tree**: grouped by harness. Each group has a dim label (`claude`,
+  `codex`, with its share of the cost), its own root (`orchestrator`, or
+  `you` when that harness's agent works alone), and its agents. The log below
+  tags each line with its harness.
+- **orbit**: one ring per harness, side by side, with the harness name dim
+  above each. If they don't fit side by side they stack, given the rows; in a
+  terminal too small for either, it shows the tree and says so.
+- **timeline**: lanes grouped by harness, a dim divider and label between
+  groups, all on one time axis.
+- **header**: `agentflow // all // <project>` and the combined cost.
+- **`s` stats**: a line per harness (agents, tool calls, cost, tokens) above
+  the per-agent lines.
+
+It shows the sessions active right now (written to in the last 10 minutes),
+one per harness. If none is active it shows each harness's most recent
+session for the project. Every ~2s it looks again: a harness that starts
+working joins the view, and a newer session in a harness replaces the old one.
+
+All sessions share one clock: `00:00:00` is the first agent's start in any
+harness. `↑`/`↓` select across all agents, and the detail view names the
+agent's harness.
+
 **Handoffs** are detected, not guessed: a finished agent's result (or its agent
-id) has to show up in a later `Agent` call's prompt, either whole or in at least
-two distinctive lines (or one long one). For agent teams, a teammate's direct
-`SendMessage` to another teammate draws a chord too.
+id) has to show up in a later agent's prompt, either whole or in at least two
+distinctive lines (or one long one). A direct message from one agent to another
+draws a chord too: a teammate's `SendMessage` in Claude Code's agent teams, a
+subagent's `send_message` in Codex.
 
 **Validators** (optional) are roles you name in the config, e.g.
 `validators = ["test-runner", "reviewer"]`. In the orbit, a validator idles as
@@ -79,7 +136,7 @@ two distinctive lines (or one long one). For agent teams, a teammate's direct
 red): an explicit `Verdict: …` line in its result wins, then the exit status of
 its last test command, then its result's wording (`LGTM`, `changes requested`, …).
 This is display only. agentflow just reads transcripts, so naming a validator
-changes how it's drawn and gates nothing in Claude Code. None are set by default;
+changes how it's drawn and gates nothing in your harness. None are set by default;
 `--demo` shows the two above so you can see what they look like.
 
 ## Agents up close
@@ -109,17 +166,24 @@ when nothing is in flight.
 
 ## Cost, stats & achievements
 
-Each row shows the agent's **model** (`haiku` / `sonnet` / `opus` / `fable`, dim,
-after its name) and its **cost so far**, which briefly flashes `+$0.02` as each
-call lands. The header shows the **session total** (orchestrator + every agent).
+Each row shows the agent's **model** (`haiku` / `sonnet` / `opus` / `fable`, or
+for OpenAI models their name, `luna` / `sol` / …, dim, after its name) and its
+**cost so far**, which briefly flashes `+$0.02` as each call lands. The header
+shows the **session total** (orchestrator + every agent), and in the mixed view
+the total across harnesses.
 
-Cost is estimated from each response's `usage` (input, output, cache reads, and
-5-minute / 1-hour cache writes) at Anthropic's first-party list prices. It ignores
-batch/priority discounts, fast mode, and subscription plans, so treat it as "what
-this would cost on the API", not your bill. Rates live in one table,
-[`src/pricing.rs`](src/pricing.rs): exact model ids first, then a per-family
-fallback so a new point release still gets a sane price. Unknown models cost $0
-rather than a guess. You can override rates in the config without rebuilding.
+**Costs are API-equivalent, not your bill.** They're computed from each
+response's token usage (input, output, cache reads and writes) at the
+provider's pay-per-token list prices (Anthropic's for Claude models, OpenAI's
+for GPT models), which is why they're shown with `≈`. If you use a
+subscription (Claude Pro/Max, ChatGPT Plus/Pro) you aren't billed per token,
+and batch or priority discounts and fast mode aren't modeled either. Treat the
+number as "what this usage would cost on the API". Rates live in one table,
+[`src/pricing.rs`](src/pricing.rs), each with the date it was last checked:
+exact model ids first, then a per-family fallback so a new point release
+still gets a sane price. A model with no known price counts as $0 and puts a
+`?` after the header total; the stats panel names it. You can override rates
+in the config without rebuilding.
 
 **`s` stats** — per agent: a tokens/sec sparkline over its lifetime, average
 tok/s, cache-hit %, and cost; the session's cache-hit %; the most-used tools; how
@@ -148,9 +212,12 @@ breaks ties). Agents that ran alongside it, off that chain, didn't change how lo
 the session took.
 
 **`l` lifetime** — totals across every session you've watched: sessions, agents,
-spend, tokens, cache savings, fastest agent, achievements collected. Needs
-`persistence` (on by default); stored in `~/.agentflow/lifetime.json`, one entry
-per session id, so re-watching a session never double counts.
+spend, tokens, cache savings, fastest agent, achievements collected, and the same
+per harness (sessions, agents, cost, tokens). Needs `persistence` (on by
+default); stored in `~/.agentflow/lifetime.json`, one entry per session id with
+the harness it ran in, so re-watching a session never double counts. Entries
+written before agentflow read more than Claude Code have no harness and count as
+Claude Code.
 
 **Achievements** pop up one line at a time, fade after ~3s, and each fires once
 per session. Only ones earned after agentflow attaches are announced.
@@ -200,20 +267,23 @@ agentflow wrapped --all                 # everything on record
 agentflow wrapped --export wrapped.svg  # the outro card as an SVG, then exit
 ```
 
-Seven full-screen slides, each animating in (numbers count up, bars fill, text
+Eight full-screen slides, each animating in (numbers count up, bars fill, text
 types out). `space` / `→` next, `←` back, `q` quit:
 
 1. **your agents, this month** — agents and sessions
-2. **what it cost** — total spend and what the cache saved
-3. **your top agent** — a character card for the role with the most output
-   tokens: face, rarity (its most-used model), personality, runs
-4. **your busiest hours** — a braille bar chart of tool calls by hour of day
-5. **time saved** — total agent time vs the wall-clock it took, as two bars
+2. **what it cost** — API-equivalent usage and what the cache saved
+3. **your tools** — per harness: sessions, agent time and API-equivalent usage,
+   with a small braille bar of agent time
+4. **your top agent** — a character card for the role with the most output
+   tokens: face, rarity (its most-used model), the harness it ran in,
+   personality, runs
+5. **your busiest hours** — a braille bar chart of tool calls by hour of day
+6. **time saved** — total agent time vs the wall-clock it took, as two bars
    ("11h20m of agent work in 6h05m"), and the difference: time saved by running
    agents in parallel
-6. **orchestrator type** — from average agents per session: soloist (≤1),
+7. **orchestrator type** — from average agents per session: soloist (≤1),
    duo (~2), conductor (3–4), swarm lord (5+)
-7. **outro** — a summary card
+8. **outro** — a summary card
 
 `--export` writes the outro as a 1200×675 SVG (X's card size): `#0a0a0a`
 background, your accent color, monospace type. With no history in the chosen
@@ -226,31 +296,66 @@ recorded before time saved existed are left out of it.
 
 ## How it works
 
-agentflow is **read-only** toward Claude Code. It watches the transcript `.jsonl`
-files Claude Code already writes under `~/.claude/projects/` and renders them at
-~20fps. It installs no hooks, writes nothing to `~/.claude`, and never touches your
-sessions. Its only writes are its own `~/.agentflow/config.toml` (created once) and,
-with `persistence` on, `~/.agentflow/lifetime.json`.
+agentflow is **read-only** toward every harness. It watches the session files
+they already write (Claude Code's transcripts under `~/.claude/projects/`,
+Codex's rollouts under `~/.codex/sessions/`) and renders them at ~20fps. It
+installs no hooks, writes nothing to any harness's directories, and never
+touches your sessions. Its only writes are its own `~/.agentflow/config.toml`
+(created once) and, with `persistence` on, `~/.agentflow/lifetime.json`.
+
+Each harness has an **adapter** that translates its files into one normalized,
+versioned [event schema](docs/schema.md). Every view, stat and feature reads
+only those events, so they work the same for every harness. See
+[docs/architecture.md](docs/architecture.md).
 
 With no flags it picks, in order:
 
-1. the most-recently-active session for your **current directory**, so running it
-   in a repo watches that repo's session;
+1. the most-recently-active session for your **current directory**, in any
+   supported harness, so running it in a repo watches that repo's session;
 2. otherwise the **most recently active session across all projects**, showing
    that project's name in the header.
 
-"Active" counts writes from background subagents too, so a session whose
-agents are still working isn't mistaken for idle. Every ~2s it re-scans, and if
-a newer session starts in the same directory it switches to it automatically
-(unless you pinned one with `--session`).
+`--source <harness>` narrows that to one harness; `--source all` shows one
+session per harness together (see *Mixed view*). "Active" counts writes from
+background subagents too, so a session whose agents are still working isn't
+mistaken for idle. Every ~2s it re-scans, and if a newer session starts in the
+same directory it switches to it automatically (unless you pinned one with
+`--session`).
 
-It reads the main transcript for subagent spawns (so an agent appears the instant
-it's dispatched) and tails each subagent's own transcript for live tool activity,
-completion, and result size. Nothing is hardcoded to any one project.
+Subagents appear the instant they're dispatched, and each one's own file is
+tailed for live tool activity, completion, and result size. Nothing is
+hardcoded to any one project.
+
+## Events: `agentflow events --json`
+
+The same normalized stream the views use, for your own tools: one JSON object
+per line on stdout, the session so far and then live as it grows.
+
+```sh
+agentflow events --json                       # follow the newest session here
+agentflow events --json --once                # what's on disk now, then exit
+agentflow events --json --source all          # every harness's session, interleaved
+agentflow events --json | jq 'select(.type == "tool_started") | .arg'
+```
+
+```json
+{"v":1,"harness":"codex","session":"01a1f49c","ts":1795105280113,"type":"tool_started","agent":"main","tool":"bash","label":"cargo","kind":"run","arg":"cargo test","blocking":true,"test":true}
+```
+
+Every event carries the schema version, its harness and session id, so a
+mixed stream can be split back apart. The fields and rules are documented in
+[docs/schema.md](docs/schema.md). It exits quietly when the reader goes away
+(`| head`).
 
 ## Roles
 
-The main session is the **orchestrator** (`◆`). Each subagent is named by role:
+A session's main agent is the one working row, named after its harness
+(`claude`, `codex`) under **you** (`◆`), until it spawns a subagent. From then on
+it's the **orchestrator** (`◆`) and each subagent gets a row.
+
+Codex subagents are named by their nickname (`socrates`), with their path as a
+dim tag where there's room (`socrates · repo_overview`). Claude Code subagents
+are named by role:
 
 | spawn | role |
 |-------|------|
@@ -264,16 +369,16 @@ Per-agent status: booting `(·_·)→(•_•)` · active `(•‿•)` (reading
 `(×_×)` in red. Progress is indeterminate while an agent runs and snaps full when
 it returns.
 
-> Note on live waiting/error states: Claude Code records permission *decisions*
-> only when they resolve, so agentflow can't see a prompt as it happens. It shows
-> **waiting** when a tool call (shell, edit, web) hasn't returned for ~10s — that
-> could be a permission prompt or just a slow command — and **error** when a tool
-> was denied or blocked. Both are best-effort from a read-only transcript, no hooks.
+> Note on live waiting/error states: neither harness records a permission prompt
+> while it's open, so agentflow can't see one as it happens. It shows **waiting**
+> when a tool call (shell, edit, web) hasn't returned for ~10s — that could be a
+> permission prompt or just a slow command — and **error** when a tool was denied
+> or blocked. Both are best-effort from read-only session files, no hooks.
 
 ## Why
 
-Multi-agent runs are a wall of scrolling text; it's hard to feel what your agents
-are actually doing. agentflow turns that firehose into a glanceable, calm little
+Multi-agent runs are a wall of scrolling text, often in several terminals at
+once; it's hard to feel what your agents are actually doing. agentflow turns that firehose into a glanceable, calm little
 dashboard — who's working, who's blocked, who's done — and makes watching your
 agents work genuinely fun.
 

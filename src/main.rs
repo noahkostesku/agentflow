@@ -1,6 +1,6 @@
-//! agentflow — a full-screen terminal visualizer for Claude Code multi-agent
-//! sessions. `--demo` replays the scripted mockup; default watches a live
-//! session's transcripts.
+//! agentflow — one live view of every coding agent you run: a full-screen
+//! terminal visualizer for Claude Code, Codex and other harnesses' sessions.
+//! `--demo` replays a scripted session; default watches a live one.
 
 mod adapters;
 mod config;
@@ -8,6 +8,7 @@ mod demo;
 mod discovery;
 mod lifetime;
 mod live;
+mod mixed;
 mod model;
 mod orbit;
 mod pricing;
@@ -44,7 +45,7 @@ const HINT: Duration = Duration::from_secs(3);
 #[derive(Parser, Debug)]
 #[command(
     name = "agentflow",
-    about = "A cute cyberpunk terminal visualizer for Claude Code multi-agent sessions",
+    about = "One live view of every coding agent you run (Claude Code, Codex)",
     version
 )]
 struct Cli {
@@ -57,7 +58,8 @@ struct Cli {
     calm: bool,
 
     /// Which harness's sessions to watch (default: the most recently active
-    /// session in any of them).
+    /// session in any of them). `all` shows every harness's session for the
+    /// project together.
     #[arg(long, value_enum, global = true)]
     source: Option<Source>,
 
@@ -116,7 +118,7 @@ enum Source {
     Opencode,
     /// planned
     Gemini,
-    /// every supported harness
+    /// every supported harness at once (the mixed view)
     All,
 }
 
@@ -147,7 +149,7 @@ enum Cmd {
         #[arg(long)]
         once: bool,
     },
-    /// Your agents, wrapped: seven animated slides from your lifetime history
+    /// Your agents, wrapped: eight animated slides from your lifetime history
     /// (space / → next, ← back, q quit).
     Wrapped {
         /// Only the last 7 days.
@@ -162,7 +164,7 @@ enum Cmd {
         /// Write the outro card as an SVG (1200×675, sized for X) and exit.
         #[arg(long, value_name = "FILE")]
         export: Option<PathBuf>,
-        /// Debug: print slide N (1–7) at --at ms, then exit.
+        /// Debug: print slide N (1–8) at --at ms, then exit.
         #[arg(long, value_name = "N", hide = true)]
         slide: Option<usize>,
         /// Debug: animation time for --slide.
@@ -247,11 +249,19 @@ fn main() -> io::Result<()> {
         eprintln!("agentflow: {why}");
         std::process::exit(2);
     });
+    // `--source all` (unless pinned to one session): every harness's
+    // session for the project, together
+    let mixed = cli.source == Some(Source::All) && cli.session.is_none();
     if let Some(Cmd::Events { once, .. }) = &cli.cmd {
-        let Some(found) = discovery::find(&harnesses, cli.session.as_deref(), Some(&cwd)) else {
-            no_session(&harnesses, cli.session.as_deref());
+        let found = if mixed {
+            discovery::find_mixed(&harnesses, &cwd)
+        } else {
+            discovery::find(&harnesses, cli.session.as_deref(), Some(&cwd)).into_iter().collect()
         };
-        return run_events(found.open(), *once);
+        if found.is_empty() {
+            no_session(&harnesses, cli.session.as_deref());
+        }
+        return run_events(found.iter().map(discovery::Found::open).collect(), *once);
     }
 
     let panel = match cli.panel.as_deref() {
@@ -281,7 +291,11 @@ fn main() -> io::Result<()> {
 
     // --- Demo mode -------------------------------------------------------
     if cli.demo {
-        let sess = demo::session(header("demo", &cwd), &set.pricing);
+        let sess = if mixed {
+            demo::mixed(header("all", &cwd), &set.pricing)
+        } else {
+            demo::session(header("demo", &cwd), &set.pricing)
+        };
         if let Some(ms) = cli.frame {
             print_ansi(&render::frame(&sess, ms, ms, &debug_view(&sess, ms, ms), &mut rng));
             return Ok(());
@@ -299,6 +313,18 @@ fn main() -> io::Result<()> {
     }
 
     // --- Live mode -------------------------------------------------------
+    if mixed {
+        let Some(m) = mixed::Mixed::open(&harnesses, &cwd, &cwd) else {
+            no_session(&harnesses, None);
+        };
+        if let Some(ms) = cli.frame {
+            let sess = m.build(&set.pricing);
+            let t = m.clock();
+            print_ansi(&render::frame(&sess, t, ms, &debug_view(&sess, t, ms), &mut rng));
+            return Ok(());
+        }
+        return finish(run_live(Watch::Mixed(m), &set, store, cli.calm), warning);
+    }
     match discovery::find(&harnesses, cli.session.as_deref(), Some(&cwd)) {
         Some(found) => {
             let live = open_live(&found, &cwd);
@@ -321,7 +347,7 @@ fn main() -> io::Result<()> {
                 fw.fell_back = f.fell_back;
                 Some(open_live(&f, &fw.cwd))
             };
-            finish(run_live(live, &set, store, cli.calm, &mut next), warning)
+            finish(run_live(Watch::One { live, next: &mut next }, &set, store, cli.calm), warning)
         }
         None if cli.session.is_some() || cli.source.is_some() => {
             no_session(&harnesses, cli.session.as_deref());
@@ -353,13 +379,17 @@ fn no_session(harnesses: &[Harness], session: Option<&str>) -> ! {
 }
 
 /// `agentflow events`: print each event as a JSON line, then keep polling.
-fn run_events(mut src: Box<dyn SourceAdapter>, once: bool) -> io::Result<()> {
+/// Several sources (`--source all`) interleave; each event names its harness
+/// and session.
+fn run_events(mut srcs: Vec<Box<dyn SourceAdapter>>, once: bool) -> io::Result<()> {
     let mut out = io::stdout().lock();
     loop {
         let mut write = || -> io::Result<()> {
-            for ev in src.poll() {
-                serde_json::to_writer(&mut out, &ev)?;
-                out.write_all(b"\n")?;
+            for src in &mut srcs {
+                for ev in src.poll() {
+                    serde_json::to_writer(&mut out, &ev)?;
+                    out.write_all(b"\n")?;
+                }
             }
             out.flush()
         };
@@ -715,45 +745,95 @@ impl Persist {
     }
 }
 
-fn run_live(
-    mut live: live::Live,
-    set: &Settings,
-    store: lifetime::Store,
-    calm: bool,
-    next: &mut dyn FnMut((Harness, &Path)) -> Option<live::Live>,
-) -> io::Result<()> {
+/// What live mode watches.
+enum Watch<'a> {
+    /// One session, hopping to a newer one via `next` (unless pinned).
+    One {
+        live: live::Live,
+        next: &'a mut dyn FnMut((Harness, &Path)) -> Option<live::Live>,
+    },
+    /// Every harness's session for the project (`--source all`).
+    Mixed(mixed::Mixed),
+}
+
+impl Watch<'_> {
+    fn refresh(&mut self) {
+        match self {
+            Watch::One { live, .. } => live.refresh(),
+            Watch::Mixed(m) => m.refresh(),
+        }
+    }
+    fn build(&self, p: &Pricing) -> model::Session {
+        match self {
+            Watch::One { live, .. } => live.build(p),
+            Watch::Mixed(m) => m.build(p),
+        }
+    }
+    fn clock(&self) -> i64 {
+        match self {
+            Watch::One { live, .. } => live.clock(),
+            Watch::Mixed(m) => m.clock(),
+        }
+    }
+    /// Pick up newer sessions. True if what's shown changed.
+    fn rescan(&mut self) -> bool {
+        match self {
+            Watch::One { live, next } => match next((live.harness(), live.path())) {
+                Some(newer) => {
+                    *live = newer;
+                    true
+                }
+                None => false,
+            },
+            Watch::Mixed(m) => m.rescan(),
+        }
+    }
+    /// Record the watched sessions' lifetime numbers (each harness's session
+    /// separately, with its harness).
+    fn record(&self, sess: &model::Session, p: &Pricing, persist: &mut Persist) {
+        match self {
+            Watch::One { live, .. } => persist.update(sess, live.clock()),
+            Watch::Mixed(m) => {
+                for (s, t) in m.parts(p) {
+                    persist.update(&s, t);
+                }
+            }
+        }
+    }
+}
+
+fn run_live(mut watch: Watch, set: &Settings, store: lifetime::Store, calm: bool) -> io::Result<()> {
     let mut term = enter()?;
     let mut rng = rand::thread_rng();
     let mut ui = Ui::new(calm);
     let mut app_start = Instant::now();
     let mut last_refresh = Instant::now();
     let mut last_scan = Instant::now();
-    let mut sess = live.build(&set.pricing);
+    let mut sess = watch.build(&set.pricing);
     let totals = store.totals();
     let mut persist = Persist { on: set.cfg.persistence, store, totals, dirty: false };
-    persist.update(&sess, live.clock());
+    watch.record(&sess, &set.pricing, &mut persist);
 
     let res = (|| -> io::Result<()> {
         loop {
-            // Every ~2s, hop to a newer session (unless pinned by --session).
+            // Every ~2s, look for a newer session (unless pinned by --session).
             if last_scan.elapsed() >= Duration::from_secs(2) {
                 last_scan = Instant::now();
-                if let Some(newer) = next((live.harness(), live.path())) {
+                if watch.rescan() {
                     persist.flush();
-                    live = newer;
-                    sess = live.build(&set.pricing);
+                    sess = watch.build(&set.pricing);
                     app_start = Instant::now(); // replay the header intro
                     ui.selected = None;
                     ui.panel = ui.base;
                 }
             }
             if last_refresh.elapsed() >= Duration::from_millis(300) {
-                live.refresh();
-                sess = live.build(&set.pricing);
-                persist.update(&sess, live.clock());
+                watch.refresh();
+                sess = watch.build(&set.pricing);
+                watch.record(&sess, &set.pricing, &mut persist);
                 last_refresh = Instant::now();
             }
-            let t = live.clock();
+            let t = watch.clock();
             let app_t = app_start.elapsed().as_millis() as i64;
             let view = ui.view(set, &sess, t, Some(&persist.totals), term_size(&term));
             paint(&mut term, render::frame(&sess, t, app_t, &view, &mut rng), render::width(&view))?;
@@ -764,8 +844,8 @@ fn run_live(
                 Key::Quit => break,
                 Key::Done => {}
                 Key::Other(KeyCode::Char('r')) => {
-                    live.refresh();
-                    sess = live.build(&set.pricing);
+                    watch.refresh();
+                    sess = watch.build(&set.pricing);
                 }
                 Key::Other(_) => {}
             }

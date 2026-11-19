@@ -1,7 +1,6 @@
-//! Frame renderer — ported from `frame(t)` / `row(a,t,last)` in
-//! agentflow-mockup.html, generalized so the same visuals drive both the demo
-//! (known finish times, looping clock) and live mode (unknown finish, real
-//! wall-clock timestamps).
+//! Frame renderer: the same visuals drive the demo (known finish times,
+//! looping clock), live mode (unknown finish, real wall-clock timestamps) and
+//! the mixed view (a group per harness).
 //!
 //! Clocks:
 //!   `t`     — session clock (ms). Agent spawn/finish are relative to the same
@@ -9,7 +8,7 @@
 //!   `app_t` — ms since agentflow launched. Drives the one-time boot intro
 //!             (header type-in, "linking…", rule draw) so it plays on startup
 //!             even when attaching to a session that began long ago.
-//! In demo mode `app_t == t`, reproducing the mockup exactly.
+//! In demo mode `app_t == t`.
 
 use rand::Rng;
 use ratatui::style::{Color, Style};
@@ -21,7 +20,7 @@ use crate::pricing::{approx_cost, fmt_cost, fmt_delta, fmt_tokens};
 use crate::stats;
 use crate::theme::*;
 
-/// Base content width (the mockup's W=64). The model badge and cost columns
+/// Base content width (64 columns). The model badge and cost columns
 /// widen it; see `width`.
 const W: i64 = 64;
 /// model badge column after the role name
@@ -130,16 +129,27 @@ fn cfrom(s: &str, start: usize) -> String {
     s.chars().skip(start).collect()
 }
 
-/// Session clock as "HH:MM:SS", offset by 161s like the mockup. The demo stays
-/// under an hour so it reads "00:MM:SS"; live sessions can run longer.
+/// Session clock as "HH:MM:SS" from 0. The demo stays under an hour so it
+/// reads "00:MM:SS"; live sessions can run longer.
 fn clk(ms: i64) -> String {
     let s = (ms / 1000).max(0);
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
-/// Fit "a // b // c" into `room` columns by shortening its longest part with
-/// "…" (the project name: "agentflow-playground" → "agentflow-pl…").
+/// Fit "a // b // c" into `room` columns: first "agentflow //" becomes
+/// "af //", then the longest part is shortened with "…" (the project name:
+/// "agentflow-playground" → "agentflow-pl…").
 fn fit_title(title: &str, room: usize) -> String {
+    if clen(title) <= room {
+        return title.to_string();
+    }
+    match title.strip_prefix("agentflow // ") {
+        Some(rest) => fit_parts(&format!("af // {rest}"), room),
+        None => fit_parts(title, room),
+    }
+}
+
+fn fit_parts(title: &str, room: usize) -> String {
     if clen(title) <= room {
         return title.to_string();
     }
@@ -186,7 +196,7 @@ pub(crate) fn current_tool(a: &Agent, t: i64) -> Option<&Tool> {
     }
 }
 
-/// Build one subagent row. Port of `row(a,t,last)`, generalized for live mode.
+/// Build one subagent row.
 fn row(
     a: &Agent,
     t: i64,
@@ -447,8 +457,6 @@ pub fn frame(
     rng: &mut impl Rng,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
-    let all = sess.all;
-    let live = sess.live;
     let calm = view.calm;
     let w = width(view);
 
@@ -511,7 +519,12 @@ pub fn frame(
     // or the tree when the terminal is too small for the ring.
     let mut orbit_fallback = false;
     if view.panel == Panel::Orbit {
-        if let Some((grid, latest)) = crate::orbit::panel(sess, t, view, w) {
+        let orbit = if sess.mixed() {
+            crate::orbit::mixed_panel(sess, t, view, w)
+        } else {
+            crate::orbit::panel(sess, t, view, w)
+        };
+        if let Some((grid, latest)) = orbit {
             out.extend(grid);
             out.push(bottom_rule(sess, t, view, w));
             out.push(latest);
@@ -523,7 +536,71 @@ pub fn frame(
 
     out.push(Line::from(""));
 
-    // --- Orchestrator row.
+    if view.panel == Panel::Detail {
+        out.extend(pad_lines(detail_panel(sess, t, view, w), body_h(sess) + 1));
+        return finish_frame(out, sess, t, view, w);
+    }
+
+    if sess.mixed() {
+        // --- Mixed view: a group per harness, each with its own root, in
+        // place of the orchestrator row and the middle.
+        let h = body_h(sess);
+        let vis: Vec<usize> = sess
+            .groups
+            .iter()
+            .flat_map(|g| visible_agents(&g.sess, t, g.local(view.selected)).into_iter().map(|i| i + g.start))
+            .collect();
+        let mid = match view.panel {
+            Panel::Main | Panel::Orbit => mixed_tree(sess, t, app_t, view, w, rng),
+            Panel::Stats => stats_panel(sess, t, &vis, view, w, h),
+            Panel::Timeline => timeline_panel(sess, t, view, w, h),
+            Panel::Lifetime => lifetime_panel(view, w, h),
+            Panel::Detail => unreachable!("handled above"),
+        };
+        debug_assert_eq!(mid.len(), h);
+        out.extend(mid);
+    } else {
+        // --- Orchestrator row.
+        out.push(root_row(sess, t, app_t));
+
+        // --- Middle: 10 lines of tree + log, or a panel.
+        let vis = visible_agents(sess, t, view.selected);
+        let mid = match view.panel {
+            Panel::Main | Panel::Orbit => main_panel(sess, t, &vis, view, w, rng),
+            Panel::Stats => stats_panel(sess, t, &vis, view, w, 10),
+            Panel::Timeline => timeline_panel(sess, t, view, w, 10),
+            Panel::Lifetime => lifetime_panel(view, w, 10),
+            Panel::Detail => unreachable!("handled above"),
+        };
+        debug_assert_eq!(mid.len(), 10);
+        out.extend(mid);
+    }
+
+    // --- Achievement popup (one at a time, fades out), or why the orbit
+    // isn't showing.
+    let popup = if view.achievements { popup_line(sess, t, app_t, calm) } else { Line::from("") };
+    out.push(if orbit_fallback && popup.spans.is_empty() {
+        Line::from(sp(" orbit needs a bigger terminal · showing the tree", D))
+    } else {
+        popup
+    });
+    finish_frame(out, sess, t, view, w)
+}
+
+/// Lines from the orchestrator row down to the popup line: the root row and
+/// the 10 below it, or in a mixed view 4 more per extra harness.
+fn body_h(sess: &Session) -> usize {
+    if sess.mixed() {
+        4 * sess.groups.len() + 7
+    } else {
+        11
+    }
+}
+
+/// The root of a tree: "◆ orchestrator" (or "you") with its model, face and
+/// state, and a "+2.1kb" as each result lands.
+fn root_row(sess: &Session, t: i64, app_t: i64) -> Line<'static> {
+    let all = sess.all;
     let fl = sess
         .agents
         .iter()
@@ -535,7 +612,7 @@ pub fn frame(
     } else {
         "(•‿•)"
     };
-    let os = if app_t < 1000 && !live {
+    let os = if app_t < 1000 && !sess.live {
         "booting".to_string()
     } else if t >= all {
         "all done ✓".to_string()
@@ -544,11 +621,6 @@ pub fn frame(
     } else {
         format!("delegating {}", SPIN[((t / 80).rem_euclid(10)) as usize])
     };
-    if view.panel == Panel::Detail {
-        out.extend(detail_panel(sess, t, view, w));
-        return finish_frame(out, sess, t, view, w);
-    }
-
     let mut o = vec![
         sp(" ◆ ", ac()),
         sp(pad(sess.root_name(), 13), B),
@@ -558,34 +630,84 @@ pub fn frame(
     ];
     if let Some(fl) = fl {
         let f = fl.finish.unwrap();
-        o.push(sp(
-            format!("+{}", fl.size),
-            if t - f - 400 < 600 { ac() } else { D },
-        ));
+        o.push(sp(format!("+{}", fl.size), if t - f - 400 < 600 { ac() } else { D }));
     }
-    out.push(Line::from(o));
+    Line::from(o)
+}
 
-    // --- Middle: 10 lines of tree + log, or a panel.
-    let vis = visible_agents(sess, t, view.selected);
-    let mid = match view.panel {
-        Panel::Main | Panel::Orbit => main_panel(sess, t, &vis, view, w, rng),
-        Panel::Stats => stats_panel(sess, t, &vis, view, w),
-        Panel::Timeline => timeline_panel(sess, t, view, w),
-        Panel::Lifetime => lifetime_panel(view, w),
-        Panel::Detail => unreachable!("handled above"),
-    };
-    debug_assert_eq!(mid.len(), 10);
-    out.extend(mid);
+/// A group's dim harness label, with its share of the cost on the right.
+fn group_label(g: &crate::model::Group, t: i64, view: &View, w: i64) -> Line<'static> {
+    let right = if view.cost { vec![sp(approx_cost(g.sess.cost_at(t)), D)] } else { Vec::new() };
+    spread(vec![sp(format!(" {}", g.harness), D)], right, w)
+}
 
-    // --- Achievement popup (one at a time, fades out), or why the orbit
-    // isn't showing.
-    let popup = if view.achievements { popup_line(sess, t, app_t, calm) } else { Line::from("") };
-    out.push(if orbit_fallback && popup.spans.is_empty() {
-        Line::from(sp(" orbit needs a bigger terminal · showing the tree", D))
+/// Mixed tree: per harness its label, its root and up to 3 rows; then the
+/// log (every harness's events, tagged) or the recap card.
+fn mixed_tree(sess: &Session, t: i64, app_t: i64, view: &View, w: i64, rng: &mut impl Rng) -> Vec<Line<'static>> {
+    let h = body_h(sess);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for g in &sess.groups {
+        out.push(group_label(g, t, view, w));
+        out.push(root_row(&g.sess, t, app_t));
+        let sel = g.local(view.selected);
+        let vis = visible_agents(&g.sess, t, sel);
+        let top = out.len();
+        for i in 0..3 {
+            out.push(match vis.get(i) {
+                Some(&k) => Line::from(row(&g.sess.agents[k], t, i == vis.len() - 1, sel == Some(k), view, sess.live, rng)),
+                None => Line::from(""),
+            });
+        }
+        // sleepy agents' z's drift into the row above (the root, for the first)
+        for (i, &k) in vis.iter().enumerate() {
+            let a = &g.sess.agents[k];
+            if t - a.spawn >= 1300 && stats::stuck_idle(a, t, view.stuck_ms).is_some() {
+                for (up, col, ch, c) in zzz(t + a.bob * 211, view.calm) {
+                    overlay(&mut out[top + i - up], col, ch, c);
+                }
+            }
+        }
+    }
+    out.push(Line::from(""));
+    let room = h.saturating_sub(out.len());
+    if view.recap {
+        out.extend(recap_lines(sess, t, view, w).into_iter().take(room));
+        return pad_lines(out, h);
+    }
+    out.push(rule("log", "", w));
+    let mut log: Vec<(&str, &crate::model::Event)> = sess
+        .groups
+        .iter()
+        .flat_map(|g| g.sess.events.iter().filter(|e| e.time <= t).map(move |e| (g.harness.as_str(), e)))
+        .collect();
+    log.sort_by_key(|(_, e)| e.time);
+    let n = room.saturating_sub(1);
+    for (tag, e) in &log[log.len().saturating_sub(n)..] {
+        out.push(log_line(e, Some(tag)));
+    }
+    pad_lines(out, h)
+}
+
+/// One log line: time, the harness (mixed view), who, what.
+fn log_line(e: &crate::model::Event, tag: Option<&str>) -> Line<'static> {
+    let detail_color = if e.detail.starts_with('?') {
+        AM
+    } else if e.color == ac() || e.color == RED {
+        e.color
     } else {
-        popup
-    });
-    finish_frame(out, sess, t, view, w)
+        G
+    };
+    let mut l = vec![sp(format!(" {}  ", clk(e.time)), D)];
+    let label_w = match tag {
+        Some(tag) => {
+            l.push(sp(pad(tag, 8), D));
+            24
+        }
+        None => 28,
+    };
+    l.push(sp(pad(&e.label, label_w), e.color));
+    l.push(sp(e.detail.clone(), detail_color));
+    Line::from(l)
 }
 
 /// "v  tree · orbit · timeline": the base view in the accent, the rest dim.
@@ -724,22 +846,7 @@ fn main_panel(
     let start = visible.len().saturating_sub(4);
     let tail = &visible[start..];
     for i in 0..4 {
-        if let Some(e) = tail.get(i) {
-            let detail_color = if e.detail.starts_with('?') {
-                AM
-            } else if e.color == ac() || e.color == RED {
-                e.color
-            } else {
-                G
-            };
-            out.push(Line::from(vec![
-                sp(format!(" {}  ", clk(e.time)), D),
-                sp(pad(&e.label, 28), e.color),
-                sp(e.detail.clone(), detail_color),
-            ]));
-        } else {
-            out.push(Line::from(""));
-        }
+        out.push(tail.get(i).map_or_else(|| Line::from(""), |e| log_line(e, None)));
     }
     out
 }
@@ -778,13 +885,15 @@ fn recap_lines(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'static>
     out
 }
 
-/// `s`: per-agent tokens/sec sparklines, cache-hit %, top tools, top files.
+/// `s`: per-agent tokens/sec sparklines, cache-hit %, top tools, top files;
+/// in a mixed view a line per harness first. `h` lines in all.
 fn stats_panel(
     sess: &Session,
     t: i64,
     vis: &[usize],
     view: &View,
     w: i64,
+    h: usize,
 ) -> Vec<Line<'static>> {
     let vis: Vec<&Agent> = vis.iter().map(|&k| &sess.agents[k]).collect();
     let mut u = crate::model::Usage::default();
@@ -806,8 +915,14 @@ fn stats_panel(
     }
     let mut out = vec![rule("stats", &hit, w)];
 
-    // 3 agent lines
-    for i in 0..3 {
+    // per harness: agents, tool calls, cost, tokens
+    for g in &sess.groups {
+        out.push(harness_line(&g.sess, &g.harness, t, view));
+    }
+
+    // agent lines: whatever's left after the 6 lines below them
+    let rows = h.saturating_sub(out.len() + 6);
+    for i in 0..rows {
         let Some(a) = vis.get(i) else {
             out.push(if i == 0 { Line::from(sp(" no agents yet", D)) } else { Line::from("") });
             continue;
@@ -885,7 +1000,31 @@ fn stats_panel(
             sp(format!("  {n}"), D),
         ]));
     }
-    out
+    pad_lines(out, h)
+}
+
+/// "claude   3 agents · 41 tool calls · ≈$0.42 · 120.3k tok"
+fn harness_line(s: &Session, name: &str, t: i64, view: &View) -> Line<'static> {
+    let agents = s.agents.iter().filter(|a| a.spawn <= t).count();
+    let calls = s.agents.iter().flat_map(|a| a.uses.iter()).filter(|u| u.time <= t).count();
+    let mut u = crate::model::Usage::default();
+    for c in s.all_calls_at(t) {
+        u.add(&c.usage);
+    }
+    let plural = |n: usize, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
+    let mut l = vec![
+        sp(format!(" {}", pad(name, 8)), B),
+        sp(plural(agents, "agent"), G),
+        sp(" · ", VD),
+        sp(plural(calls, "tool call"), G),
+    ];
+    if view.cost {
+        l.push(sp(" · ", VD));
+        l.push(sp(approx_cost(s.cost_at(t)), G));
+    }
+    l.push(sp(" · ", VD));
+    l.push(sp(format!("{} tok", fmt_tokens(u.total())), D));
+    Line::from(l)
 }
 
 /// Last `n` chars of a path, cut at a '/' when possible ("…/src/render.rs").
@@ -904,8 +1043,10 @@ fn short_path(p: &str, n: usize) -> String {
 /// `t`: swimlanes. One lane per agent (orchestrator first) across the session,
 /// braille dots as dense as the activity in each slice of time: accent while
 /// active, dim while waiting or idle, a red tick where an error landed. Below:
-/// a time axis and the session's peak parallelism.
-fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'static>> {
+/// a time axis and the session's peak parallelism. In a mixed view the lanes
+/// are grouped by harness, a dim divider and label above each group, all on
+/// one time axis. `h` lines in all.
+fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64, h: usize) -> Vec<Line<'static>> {
     // Once everyone is done the axis stops at the last finish, so a session
     // that ended a while ago still fills the width.
     let span = t.min(sess.all).max(1);
@@ -916,8 +1057,6 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'stat
         right += &format!(" · saved {}", dur((par.saved_ms() as f64 * scale / 1000.0) as i64));
     }
     let mut out = vec![rule("timeline", &right, w)];
-    // the chain of agents that set the session's length: brighter mauve
-    let critical = stats::critical_path(sess, t);
 
     const LABEL: usize = 17;
     let cells = (w as usize).saturating_sub(LABEL + 1).max(8);
@@ -928,26 +1067,59 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'stat
         (c0, c1)
     };
 
-    let started: Vec<usize> = (0..sess.agents.len()).filter(|&i| sess.agents[i].spawn <= t).collect();
-    let shown: Vec<(usize, &Agent)> =
-        started[started.len().saturating_sub(6)..].iter().map(|&i| (i, &sess.agents[i])).collect();
-
-    // Activity per lane: orchestrator = its own calls + every dispatch.
-    let orch_times = sess
-        .orch_calls
-        .iter()
-        .map(|c| c.time)
-        .chain(sess.agents.iter().map(|a| a.spawn))
-        .filter(|x| *x <= t);
-    let orch = stats::density(orch_times, span, cells);
-    let lanes: Vec<Vec<u32>> = shown
-        .iter()
-        .map(|(_, a)| {
-            let times = a.uses.iter().map(|u| u.time).chain(a.calls.iter().map(|c| c.time));
-            stats::density(times.filter(|x| *x <= t), span, cells)
+    /// One harness's lanes (or the whole session's): its root and newest agents.
+    struct Block<'a> {
+        label: Option<&'a str>,
+        sess: &'a Session,
+        orch: Vec<u32>,
+        /// (index into `sess.agents`, activity per cell)
+        lanes: Vec<(usize, Vec<u32>)>,
+        /// the chain of agents that set its length: brighter mauve
+        critical: Vec<usize>,
+        started: usize,
+    }
+    let parts: Vec<(Option<&str>, &Session)> = if sess.mixed() {
+        sess.groups.iter().map(|g| (Some(g.harness.as_str()), &g.sess)).collect()
+    } else {
+        vec![(None, sess)]
+    };
+    // rule, axis and parallelism lines aside, the room splits evenly: a
+    // label (mixed), the root, then as many agents as fit
+    let per = h.saturating_sub(3) / parts.len();
+    let cap = per.saturating_sub(1 + usize::from(sess.mixed()));
+    let blocks: Vec<Block> = parts
+        .into_iter()
+        .map(|(label, s)| {
+            let started: Vec<usize> = (0..s.agents.len()).filter(|&i| s.agents[i].spawn <= t).collect();
+            // Activity per lane: the root = its own calls + every dispatch.
+            let orch_times =
+                s.orch_calls.iter().map(|c| c.time).chain(s.agents.iter().map(|a| a.spawn)).filter(|x| *x <= t);
+            let lanes = started[started.len().saturating_sub(cap)..]
+                .iter()
+                .map(|&i| {
+                    let a = &s.agents[i];
+                    let times = a.uses.iter().map(|u| u.time).chain(a.calls.iter().map(|c| c.time));
+                    (i, stats::density(times.filter(|x| *x <= t), span, cells))
+                })
+                .collect();
+            Block {
+                label,
+                sess: s,
+                orch: stats::density(orch_times, span, cells),
+                lanes,
+                critical: stats::critical_path(s, t),
+                started: started.len(),
+            }
         })
         .collect();
-    let max = lanes.iter().chain([&orch]).flatten().copied().max().unwrap_or(0).max(1);
+    let max = blocks
+        .iter()
+        .flat_map(|b| b.lanes.iter().map(|(_, d)| d).chain([&b.orch]))
+        .flatten()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(1);
     let level = |n: u32| -> char {
         // alive but quiet keeps a faint baseline so the lane reads as a span
         const L: [char; 8] = ['⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿', '⣿'];
@@ -958,16 +1130,8 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'stat
         }
     };
 
-    // orchestrator lane: alive across the whole axis
-    let mut l = vec![sp(" ◆ ", ac()), sp(pad(sess.root_name(), LABEL - 3), B)];
-    for n in &orch {
-        l.push(sp(level(*n).to_string(), ac()));
-    }
-    out.push(Line::from(l));
-
-    for ((i, a), dens) in shown.iter().zip(&lanes) {
+    let lane = |a: &Agent, dens: &[u32], crit: bool| -> Line<'static> {
         let end = a.finish.unwrap_or(t).min(t);
-        let crit = critical.contains(i);
         let on = if crit { light() } else { ac() };
         let mut l = vec![sp(" ", D), rarity_span(&a.model, false)];
         // "socrates · repo_overview": the tag dim after the name, clipped
@@ -995,9 +1159,28 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'stat
                 l.push(sp(level(*n).to_string(), if waiting { D } else { on }));
             }
         }
+        Line::from(l)
+    };
+
+    for b in &blocks {
+        if let Some(label) = b.label {
+            let head = format!(" {label} ");
+            out.push(Line::from(vec![
+                sp(head.clone(), D),
+                sp("┄".repeat((w as usize).saturating_sub(clen(&head) + 1)), VD),
+            ]));
+        }
+        // the root's lane: alive across the whole axis
+        let mut l = vec![sp(" ◆ ", ac()), sp(pad(b.sess.root_name(), LABEL - 3), B)];
+        for n in &b.orch {
+            l.push(sp(level(*n).to_string(), ac()));
+        }
         out.push(Line::from(l));
+        for (i, dens) in &b.lanes {
+            out.push(lane(&b.sess.agents[*i], dens, b.critical.contains(i)));
+        }
     }
-    if started.is_empty() {
+    if blocks.iter().all(|b| b.started == 0) {
         out.push(Line::from(sp(" no agents yet", D)));
     }
 
@@ -1017,9 +1200,11 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'stat
             }
         }
     }
-    out = pad_lines(out, 8);
+    out = pad_lines(out, h.saturating_sub(2));
     // the axis line's label column doubles as the critical-path legend
-    let legend = shown.iter().any(|(i, _)| critical.contains(i)) && critical.len() > 1;
+    let legend = blocks
+        .iter()
+        .any(|b| b.critical.len() > 1 && b.lanes.iter().any(|(i, _)| b.critical.contains(i)));
     out.push(Line::from(vec![
         if legend { sp(pad(" ⣿ critical path", LABEL), light()) } else { sp(" ".repeat(LABEL), D) },
         sp(axis.into_iter().collect::<String>(), D),
@@ -1099,6 +1284,10 @@ fn detail_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'static
     }
     if let Some(p) = pers {
         meta.push(p.to_string());
+    }
+    // which harness it runs in, when several are on screen
+    if let Some(g) = view.selected.and_then(|i| sess.group_of(i)) {
+        meta.push(g.harness.clone());
     }
     if !meta.is_empty() {
         left.push(sp(format!("   {}", meta.join(" · ")), D));
@@ -1286,14 +1475,15 @@ fn dur(secs: i64) -> String {
     }
 }
 
-/// `l`: lifetime totals across sessions (needs persistence).
-fn lifetime_panel(view: &View, w: i64) -> Vec<Line<'static>> {
+/// `l`: lifetime totals across sessions (needs persistence), then a line per
+/// harness (up to 3, or fewer to keep `h` lines).
+fn lifetime_panel(view: &View, w: i64, h: usize) -> Vec<Line<'static>> {
     let mut out = vec![rule("lifetime", "", w)];
     let Some(lt) = view.lifetime else {
         out.push(Line::from(""));
         out.push(Line::from(sp(" persistence is off", G)));
         out.push(Line::from(sp(" set persistence = true in ~/.agentflow/config.toml", D)));
-        return pad_lines(out, 10);
+        return pad_lines(out, h);
     };
     let kv = |k: &str, v: String, k2: &str, v2: String| {
         Line::from(vec![
@@ -1315,6 +1505,24 @@ fn lifetime_panel(view: &View, w: i64) -> Vec<Line<'static>> {
         "fastest",
         lt.fastest_ms.map_or("·".into(), |ms| format!("{:.1}s", ms as f64 / 1000.0)),
     ));
+    // per harness: room for what the achievements (3 lines) leave
+    let rows = h.saturating_sub(out.len() + 3).min(3);
+    for ht in lt.harnesses.iter().take(rows) {
+        let plural = |n: usize, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
+        let mut l = vec![
+            sp(format!(" {}", pad(&ht.harness, 10)), B),
+            sp(plural(ht.sessions, "session"), G),
+            sp(" · ", VD),
+            sp(plural(ht.agents, "agent"), G),
+        ];
+        if view.cost {
+            l.push(sp(" · ", VD));
+            l.push(sp(approx_cost(ht.cost), G));
+        }
+        l.push(sp(" · ", VD));
+        l.push(sp(format!("{} tok", fmt_tokens(ht.tokens)), D));
+        out.push(Line::from(l));
+    }
     out.push(Line::from(""));
     let kinds = [
         stats::Kind::Speedrun,
@@ -1335,7 +1543,7 @@ fn lifetime_panel(view: &View, w: i64) -> Vec<Line<'static>> {
         l.push(sp(format!("{} ✦  ", k.title()), if has(k) { ac() } else { VD }));
     }
     out.push(Line::from(l));
-    pad_lines(out, 10)
+    pad_lines(out, h)
 }
 
 /// The current achievement popup, if any: "speedrun ✦  scout · 7s". Pops in
@@ -1384,8 +1592,11 @@ mod tests {
     #[test]
     fn long_titles_shorten_instead_of_colliding() {
         assert_eq!(fit_title("agentflow // codex // demo", 40), "agentflow // codex // demo");
+        // narrow: "agentflow //" goes to "af //" before the project is cut
+        assert_eq!(fit_title("agentflow // codex // agentflow-playground", 42), "agentflow // codex // agentflow-playground");
+        assert_eq!(fit_title("agentflow // codex // agentflow-playground", 41), "af // codex // agentflow-playground");
         let t = fit_title("agentflow // codex // agentflow-playground", 34);
-        assert_eq!(t, "agentflow // codex // agentflow-p…");
+        assert_eq!(t, "af // codex // agentflow-playgrou…");
         assert!(clen(&fit_title("agentflow // a-very-long-project-name-indeed // 1a2b", 30)) <= 30);
 
         let p = crate::pricing::Pricing::default();
@@ -1397,7 +1608,7 @@ mod tests {
         assert!(clen(&header) <= width(&v) as usize, "{header}");
     }
 
-    /// Clock times are real elapsed time (the mockup's 00:02:41 start is gone).
+    /// Clock times are real elapsed time, from 00:00:00.
     #[test]
     fn clock_starts_at_zero() {
         assert_eq!(clk(0), "00:00:00");
@@ -1712,6 +1923,166 @@ mod tests {
         let lines = frame(&s, t, t, &narrow, &mut rng);
         let team = lines.iter().map(|l| text(std::slice::from_ref(l))).find(|l| l.contains("team")).unwrap();
         assert!(team.trim_end().chars().count() as i64 <= width(&narrow) && !team.contains("of work"), "{team}");
+    }
+
+    fn mixed_demo() -> Session {
+        crate::demo::mixed("agentflow // all // playground".into(), &crate::pricing::Pricing::default())
+    }
+
+    /// Every mixed panel renders `body_h + 6` lines (the orbit: its rings
+    /// plus chrome) within the frame width, selection and recap included.
+    #[test]
+    fn mixed_panels_fit_the_frame() {
+        let s = mixed_demo();
+        let totals = crate::lifetime::Totals {
+            harnesses: vec![
+                crate::lifetime::HarnessTotals { harness: "claude".into(), sessions: 3, ..Default::default() },
+                crate::lifetime::HarnessTotals { harness: "codex".into(), sessions: 1, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let want = body_h(&s) + 6;
+        assert_eq!(want, H as usize + 4, "one more harness: 4 more lines");
+        let mut rng = rand::thread_rng();
+        for cost in [false, true] {
+            for panel in [Panel::Main, Panel::Orbit, Panel::Stats, Panel::Timeline, Panel::Lifetime, Panel::Detail] {
+                for t in (0..s.length).step_by(250) {
+                    let v = View {
+                        calm: t % 500 == 0,
+                        cost,
+                        flashes: cost,
+                        achievements: true,
+                        recap: recap_due(&s, t),
+                        panel,
+                        footer: t < 3000,
+                        lifetime: Some(&totals),
+                        selected: Some((t / 250) as usize % s.agents.len()),
+                        stuck_ms: if t % 1000 == 0 { 300 } else { 120_000 },
+                        base: panel,
+                        term: (0, 0),
+                        validators: &[],
+                    };
+                    let lines = frame(&s, t, t, &v, &mut rng);
+                    if panel != Panel::Orbit {
+                        assert_eq!(lines.len(), want, "{panel:?} t={t}");
+                    }
+                    for l in &lines {
+                        let n = l.spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+                        assert!(n as i64 <= width(&v), "{panel:?} t={t}: {n} > {}", width(&v));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The tree groups agents by harness: a dim label, its own root, its
+    /// rows; the log tags each line with its harness; the header totals both.
+    #[test]
+    fn mixed_tree_groups_by_harness() {
+        let s = mixed_demo();
+        let mut rng = rand::thread_rng();
+        let v = View { calm: true, cost: true, ..View::default() };
+        let lines = frame(&s, 8_000, 8_000, &v, &mut rng);
+        let rows: Vec<String> = text(&lines).lines().map(str::to_string).collect();
+        assert!(rows[0].contains("agentflow // all // playground"), "{}", rows[0]);
+        assert!(rows[0].contains(&approx_cost(s.cost_at(8_000))), "combined cost: {}", rows[0]);
+        let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap_or_else(|| panic!("{needle}: {rows:#?}"));
+        let (claude, codex) = (at(" claude "), at(" codex "));
+        assert!(claude < at("scout") && at("fixer") < codex && codex < at("socrates"), "{rows:#?}");
+        assert_eq!(rows.iter().filter(|r| r.contains("◆ orchestrator")).count(), 2, "a root per harness");
+        assert_eq!(lines[claude].spans[0].style.fg, Some(D), "the label is dim");
+        let log = &rows[at("── log")..];
+        assert!(log.iter().any(|r| r.contains("  claude  ")) && log.iter().any(|r| r.contains("  codex   ")), "{log:#?}");
+
+        // selection is by mixed index; the detail view names the harness
+        let v = View { panel: Panel::Detail, selected: Some(3), ..v };
+        let txt = text(&frame(&s, 8_000, 8_000, &v, &mut rng));
+        assert!(txt.contains("socrates · repo_overview") && txt.contains("codex"), "{txt}");
+        let v = View { panel: Panel::Main, selected: Some(3), ..v };
+        let lines = frame(&s, 8_000, 8_000, &v, &mut rng);
+        let marked: Vec<String> = text(&lines).lines().filter(|l| l.starts_with('›')).map(str::to_string).collect();
+        assert!(marked.len() == 1 && marked[0].contains("socrates"), "{marked:?}");
+    }
+
+    /// Stats: a line per harness; timeline: lanes grouped under a dim
+    /// divider per harness, on one axis; lifetime: a line per harness.
+    #[test]
+    fn mixed_stats_timeline_and_lifetime_split_by_harness() {
+        let s = mixed_demo();
+        let mut rng = rand::thread_rng();
+        let v = View { calm: true, cost: true, panel: Panel::Stats, ..View::default() };
+        let txt = text(&frame(&s, 14_000, 14_000, &v, &mut rng));
+        let claude = format!("claude  3 agents · {} tool calls · {}", s.groups[0].sess.agents.iter().map(|a| a.uses.len()).sum::<usize>(), approx_cost(s.groups[0].sess.cost_at(14_000)));
+        assert!(txt.contains(&claude), "{claude}: {txt}");
+        assert!(txt.contains(" codex   2 agents · "), "{txt}");
+        for name in ["scout", "reviewer", "fixer", "socrates", "hume"] {
+            assert!(txt.contains(name), "every visible agent gets a line: {name}");
+        }
+
+        let v = View { panel: Panel::Timeline, ..v };
+        let rows: Vec<String> = text(&frame(&s, 14_000, 14_000, &v, &mut rng)).lines().map(str::to_string).collect();
+        let at = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap_or_else(|| panic!("{needle}: {rows:#?}"));
+        assert!(rows[at(" claude ┄")].contains('┄') && at(" claude ┄") < at("scout") && at("fixer") < at(" codex ┄"));
+        assert!(at(" codex ┄") < at("socrates · r") && at("hume") < at("parallelism"));
+        assert_eq!(rows.iter().filter(|r| r.contains("◆ orchestrator")).count(), 2);
+        assert!(rows.iter().filter(|r| r.contains("0s")).count() == 1, "one shared axis: {rows:#?}");
+
+        let totals = crate::lifetime::Totals {
+            sessions: 4,
+            harnesses: vec![
+                crate::lifetime::HarnessTotals { harness: "claude".into(), sessions: 3, agents: 9, cost: 1.5, tokens: 2_000_000, work_ms: 0 },
+                crate::lifetime::HarnessTotals { harness: "codex".into(), sessions: 1, agents: 2, cost: 0.25, tokens: 40_000, work_ms: 0 },
+            ],
+            ..Default::default()
+        };
+        for sess in [&s, &crate::demo::session("h".into(), &crate::pricing::Pricing::default())] {
+            let v = View { panel: Panel::Lifetime, lifetime: Some(&totals), ..v };
+            let txt = text(&frame(sess, 1_000, 1_000, &v, &mut rng));
+            assert!(txt.contains("claude    3 sessions · 9 agents · ≈$1.50 · 2.0M tok"), "{txt}");
+            assert!(txt.contains("codex     1 session · 2 agents · ≈$0.25 · 40.0k tok"), "{txt}");
+            assert!(txt.contains("achievements"), "{txt}");
+        }
+    }
+
+    /// Orbit: rings side by side (names above), stacked when too narrow for
+    /// that but tall enough, else the tree.
+    #[test]
+    fn mixed_orbit_side_by_side_stacked_or_tree() {
+        let s = mixed_demo();
+        let mut rng = rand::thread_rng();
+        let v = View { calm: true, panel: Panel::Orbit, base: Panel::Orbit, term: (120, 40), ..View::default() };
+        let rows: Vec<String> = text(&frame(&s, 8_000, 8_000, &v, &mut rng)).lines().map(str::to_string).collect();
+        let names = &rows[2];
+        assert!(names.contains("claude") && names.contains("codex"), "names above the rings: {names}");
+        let both = rows.iter().filter(|r| r.matches('◆').count() == 2).count();
+        assert_eq!(both, 1, "two centers on one line: {rows:#?}");
+        assert!(rows.last().unwrap().contains("latest") || rows.iter().any(|r| r.contains("latest  c")), "{rows:#?}");
+
+        // more agents than half the width holds: stacked, given the height
+        let mut big = crate::demo::mixed("h".into(), &crate::pricing::Pricing::default());
+        let extra = big.groups[0].sess.agents[0].clone();
+        big.groups[0].sess.agents.push(extra);
+        let parts: Vec<(String, Session)> = big.groups.into_iter().map(|g| (g.harness, g.sess)).collect();
+        let big = crate::mixed::merge("h".into(), parts);
+        let rows: Vec<String> = text(&frame(&big, 8_000, 8_000, &v, &mut rng)).lines().map(str::to_string).collect();
+        let centers: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.contains('◆')).map(|(i, _)| i).collect();
+        assert_eq!(centers.len(), 2, "stacked: {rows:#?}");
+        assert!(rows.iter().any(|r| r.trim() == "claude") && rows.iter().any(|r| r.trim() == "codex"), "{rows:#?}");
+
+        // not enough room for either: the tree, saying why
+        let small = View { term: (90, 24), ..v };
+        let txt = text(&frame(&big, 8_000, 8_000, &small, &mut rng));
+        assert!(txt.contains("orbit needs a bigger terminal") && txt.contains("── log"), "{txt}");
+    }
+
+    /// The header keeps the mixed label and shortens "agentflow //" first.
+    #[test]
+    fn mixed_header_shortens_agentflow_first() {
+        let mut s = mixed_demo();
+        s.header = "agentflow // all // my-playground".into();
+        let v = View { calm: true, cost: true, ..View::default() };
+        let hdr = text(&frame(&s, 8_000, 8_000, &v, &mut rand::thread_rng())).lines().next().unwrap().to_string();
+        assert!(hdr.contains("af // all // my-playground") && !hdr.contains("…"), "{hdr}");
     }
 
     #[test]

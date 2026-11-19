@@ -1,5 +1,5 @@
 //! `agentflow wrapped`: a year-in-review style recap of your agents, built
-//! from `~/.agentflow/lifetime.json`. Seven full-screen slides that animate in,
+//! from `~/.agentflow/lifetime.json`. Eight full-screen slides that animate in,
 //! plus an SVG export of the outro card sized for X (1200×675).
 
 use std::collections::HashMap;
@@ -7,13 +7,13 @@ use std::collections::HashMap;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
-use crate::lifetime::Store;
+use crate::lifetime::{per_harness, HarnessTotals, Store};
 use crate::model::rarity;
 use crate::pricing::fmt_tokens;
 use crate::stats::{classify, Personality};
 use crate::theme::{ac, dim, B, D, G, VD};
 
-pub const SLIDES: usize = 7;
+pub const SLIDES: usize = 8;
 /// Content width of a slide.
 pub const CW: usize = 56;
 
@@ -52,6 +52,8 @@ pub struct TopAgent {
     pub output: u64,
     pub runs: usize,
     pub cost: f64,
+    /// the harness it ran in most ("claude", "codex")
+    pub harness: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -72,6 +74,9 @@ pub struct Wrapped {
     /// that recorded both
     pub work_ms: i64,
     pub wall_ms: i64,
+    /// sessions, agent time and API-equivalent cost per harness, most
+    /// sessions first
+    pub harnesses: Vec<HarnessTotals>,
 }
 
 impl Wrapped {
@@ -122,6 +127,7 @@ pub fn aggregate(store: &Store, range: Range, now_ms: i64) -> Wrapped {
         avg_agents: 0.0,
         work_ms: 0,
         wall_ms: 0,
+        harnesses: per_harness(entries.iter().copied()),
     };
     /// Everything one role did across the range.
     #[derive(Default)]
@@ -131,6 +137,7 @@ pub fn aggregate(store: &Store, range: Range, now_ms: i64) -> Wrapped {
         cost: f64,
         mix: [u32; 4],
         models: HashMap<&'a str, usize>,
+        harnesses: HashMap<&'a str, usize>,
     }
     let mut roles: HashMap<&str, RoleAcc> = HashMap::new();
     for e in &entries {
@@ -157,23 +164,24 @@ pub fn aggregate(store: &Store, range: Range, now_ms: i64) -> Wrapped {
             if !a.model.is_empty() {
                 *r.models.entry(a.model.as_str()).or_default() += 1;
             }
+            *r.harnesses.entry(e.harness()).or_default() += 1;
         }
     }
     if w.sessions > 0 {
         w.avg_agents = w.agents as f64 / w.sessions as f64;
     }
     // Top agent: most output tokens, then most runs, then name (stable).
+    // the most frequent key (ties: alphabetically first)
+    let most = |m: HashMap<&str, usize>| {
+        m.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0))).map(|(k, _)| k.to_string()).unwrap_or_default()
+    };
     w.top = roles
         .into_iter()
         .max_by(|(an, a), (bn, b)| (a.output, a.runs, bn).cmp(&(b.output, b.runs, an)))
         .map(|(role, r)| TopAgent {
             role: role.to_string(),
-            model: r
-                .models
-                .into_iter()
-                .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))
-                .map(|(m, _)| m.to_string())
-                .unwrap_or_default(),
+            model: most(r.models),
+            harness: most(r.harnesses),
             personality: classify(r.mix),
             output: r.output,
             runs: r.runs,
@@ -205,10 +213,29 @@ pub fn demo(range: Range) -> Wrapped {
             output: 1_240_000,
             runs: 41,
             cost: 17.90,
+            harness: "claude".into(),
         }),
         avg_agents: 118.0 / 34.0,
         work_ms: (11 * 60 + 20) * 60_000,
         wall_ms: (6 * 60 + 5) * 60_000,
+        harnesses: vec![
+            HarnessTotals {
+                harness: "claude".into(),
+                sessions: 24,
+                agents: 91,
+                cost: 31.40,
+                tokens: 47_100_000,
+                work_ms: (8 * 60 + 12) * 60_000,
+            },
+            HarnessTotals {
+                harness: "codex".into(),
+                sessions: 10,
+                agents: 27,
+                cost: 10.78,
+                tokens: 14_300_000,
+                work_ms: (3 * 60 + 8) * 60_000,
+            },
+        ],
     }
 }
 
@@ -274,10 +301,11 @@ pub fn slide(w: &Wrapped, i: usize, ms: i64) -> Vec<Line<'static>> {
     let body = match i {
         0 => slide_agents(w, ms),
         1 => slide_spend(w, ms),
-        2 => slide_top(w, ms),
-        3 => slide_hours(w, ms),
-        4 => slide_time(w, ms),
-        5 => slide_type(w, ms),
+        2 => slide_tools(w, ms),
+        3 => slide_top(w, ms),
+        4 => slide_hours(w, ms),
+        5 => slide_time(w, ms),
+        6 => slide_type(w, ms),
         _ => outro_lines(w, ms),
     };
     out.extend(body);
@@ -353,6 +381,37 @@ fn slide_spend(w: &Wrapped, ms: i64) -> Vec<Line<'static>> {
     ]
 }
 
+/// The harnesses you ran agents in: sessions, agent time and API-equivalent
+/// usage each, with a small bar of agent time.
+fn slide_tools(w: &Wrapped, ms: i64) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(sp(center(&typed("your tools", ms, 0)), G)), blank(), blank()];
+    if w.harnesses.is_empty() {
+        out.push(Line::from(sp(center("no sessions yet"), D)));
+        return out;
+    }
+    const BAR: f64 = 12.0;
+    let max = w.harnesses.iter().map(|h| h.work_ms).max().unwrap_or(0).max(1) as f64;
+    for (i, h) in w.harnesses.iter().take(4).enumerate() {
+        let delay = 300 + 250 * i as i64;
+        let grow = ease(ms, delay, 900);
+        let cells = BAR * h.work_ms as f64 / max * grow;
+        let full = cells.floor() as usize;
+        let part = ["", "⡀", "⣀", "⣄", "⣤", "⣦", "⣶", "⣷"][((cells - full as f64) * 8.0) as usize % 8];
+        let bar = format!("{}{part}", "⣿".repeat(full));
+        let sessions = format!("{} session{}", h.sessions, if h.sessions == 1 { "" } else { "s" });
+        out.push(Line::from(vec![
+            sp(format!("    {:<8}", h.harness), if i == 0 { ac() } else { B }),
+            sp(format!("{sessions:<12}"), G),
+            sp(format!("{:>6} ", hm((h.work_ms as f64 * grow) as i64)), B),
+            sp(format!("{bar:<12}"), if i == 0 { ac() } else { dim(ac(), 0.6) }),
+            sp(format!(" ≈{}", money(h.cost * grow)), G),
+        ]));
+        out.push(blank());
+    }
+    out.push(Line::from(sp(center(&typed("sessions · agent time · API-equivalent usage", ms, 1400)), VD)));
+    out
+}
+
 fn slide_top(w: &Wrapped, ms: i64) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(sp(center(&typed("your top agent", ms, 0)), G)), blank()];
     let Some(t) = &w.top else {
@@ -374,11 +433,9 @@ fn slide_top(w: &Wrapped, ms: i64) -> Vec<Line<'static>> {
     out.push(line(String::new(), G, 0));
     out.push(line(if ms < 600 { "(·_·)".into() } else { "(^‿^)".into() }, ac(), 200));
     out.push(line(format!("{glyph} {}", t.role).trim().to_string(), B, 500));
-    out.push(line(
-        if tier.is_empty() { t.model.clone() } else { format!("{} · {tier}", t.model) },
-        D,
-        800,
-    ));
+    // where it ran, its model and tier: "claude · opus · legendary"
+    let meta: Vec<&str> = [t.harness.as_str(), t.model.as_str(), tier].into_iter().filter(|s| !s.is_empty()).collect();
+    out.push(line(meta.join(" · "), D, 800));
     out.push(line(
         t.personality.map_or(String::new(), |p| format!("personality: {}", p.label())),
         G,
@@ -741,13 +798,45 @@ mod tests {
         let txt = |w: &Wrapped, i: usize| -> String {
             slide(w, i, 10_000).iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n").collect()
         };
-        let s = txt(&w, 4);
+        let s = txt(&w, 5);
         assert!(s.contains("5m") && s.contains("9m of agent work in 4m"), "{s}");
-        assert!(txt(&w, 6).contains("time saved   5m running in parallel"));
+        assert!(txt(&w, 7).contains("time saved   5m running in parallel"));
         // nothing recorded: says so instead of "0s"
         let none = aggregate(&Store::default(), Range::Month, NOW);
-        assert!(txt(&none, 4).contains("nothing ran in parallel yet"));
+        assert!(txt(&none, 5).contains("nothing ran in parallel yet"));
         assert!(svg(&none).contains("time saved"));
+    }
+
+    /// "your tools": a line per harness (sessions, agent time, ≈cost, a bar),
+    /// old entries counting as Claude Code; the top agent names its harness.
+    #[test]
+    fn your_tools_slide_and_top_agent_harness() {
+        let mut cx = entry(1, vec![rec("socrates", "sol", [3, 0, 1, 0], 900)], &[]);
+        cx.harness = "codex".into();
+        cx.work_ms = 30 * 60_000;
+        let mut old = entry(2, vec![rec("scout", "haiku", [5, 0, 0, 0], 100)], &[]);
+        old.work_ms = 90 * 60_000;
+        let mut cl = entry(3, vec![rec("scout", "haiku", [5, 0, 0, 0], 100)], &[]);
+        cl.harness = "claude".into();
+        cl.work_ms = 60 * 60_000;
+        let w = aggregate(&store(vec![("cx", cx), ("old", old), ("cl", cl)]), Range::Month, NOW);
+        let names: Vec<(&str, usize, i64)> = w.harnesses.iter().map(|h| (h.harness.as_str(), h.sessions, h.work_ms)).collect();
+        assert_eq!(names, [("claude", 2, 150 * 60_000), ("codex", 1, 30 * 60_000)]);
+        let top = w.top.as_ref().unwrap();
+        assert_eq!((top.role.as_str(), top.harness.as_str()), ("socrates", "codex"));
+
+        let txt = |i: usize| -> String {
+            slide(&w, i, 10_000).iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n").collect()
+        };
+        let tools = txt(2);
+        assert!(tools.contains("your tools"), "{tools}");
+        let claude = tools.lines().find(|l| l.contains("claude")).unwrap();
+        let codex = tools.lines().find(|l| l.contains("codex")).unwrap();
+        assert!(claude.contains("2 sessions") && claude.contains("2h30m") && claude.contains("≈$2.00"), "{claude}");
+        assert!(codex.contains("1 session ") && codex.contains("30m") && codex.contains("≈$1.00"), "{codex}");
+        assert!(claude.matches('⣿').count() > codex.matches('⣿').count(), "bars by agent time");
+        assert!(txt(3).contains("codex · sol"), "{}", txt(3));
+        assert!(txt(2).contains("your tools") && slide(&aggregate(&Store::default(), Range::Month, NOW), 2, 10_000).len() > 3);
     }
 
     #[test]

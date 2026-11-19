@@ -2,7 +2,7 @@
 name = "agentflow"
 version = "0.1.0"
 edition = "2021"
-description = "A full-screen terminal visualizer for Claude Code multi-agent sessions"
+description = "One live view of every coding agent you run: a terminal visualizer for Claude Code, Codex and other agent harnesses"
 
 [[bin]]
 name = "agentflow"

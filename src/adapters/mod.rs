@@ -4,6 +4,7 @@
 //! harness's on-disk format. See `docs/adapters.md`.
 
 pub mod claude;
+pub mod codex;
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};

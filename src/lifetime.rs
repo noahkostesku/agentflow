@@ -31,6 +31,24 @@ pub struct Entry {
     pub work_ms: i64,
     /// wall-clock from the first dispatch to the last agent's end, ms
     pub wall_ms: i64,
+    /// the harness it ran in ("claude", "codex"). Empty in entries written
+    /// before agentflow watched more than Claude Code: see [`Entry::harness`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub harness: String,
+    /// tool calls made (0 in entries from before it was recorded)
+    pub tool_calls: u64,
+}
+
+impl Entry {
+    /// The harness, with entries from before the field existed counted as
+    /// Claude Code (the only harness agentflow read then).
+    pub fn harness(&self) -> &str {
+        if self.harness.is_empty() {
+            "claude"
+        } else {
+            &self.harness
+        }
+    }
 }
 
 /// What `wrapped` needs to know about one agent.
@@ -75,6 +93,20 @@ pub struct Totals {
     pub unlocked: Vec<String>,
     pub earned: usize,
     pub fastest_ms: Option<i64>,
+    /// the same sums per harness, most sessions first
+    pub harnesses: Vec<HarnessTotals>,
+}
+
+/// Lifetime sums for one harness.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HarnessTotals {
+    pub harness: String,
+    pub sessions: usize,
+    pub agents: usize,
+    pub cost: f64,
+    pub tokens: u64,
+    /// summed agent run time, ms
+    pub work_ms: i64,
 }
 
 pub fn path() -> PathBuf {
@@ -146,6 +178,8 @@ impl Store {
                     ms: (a.finish.unwrap_or(t).min(t) - a.spawn).max(0),
                 })
                 .collect(),
+            harness: s.harness.map_or_else(String::new, |h| h.name().to_string()),
+            tool_calls: s.agents.iter().flat_map(|a| a.uses.iter()).filter(|u| u.time <= t).count() as u64,
         };
         if self.sessions.get(id) == Some(&entry) {
             return false;
@@ -172,8 +206,31 @@ impl Store {
             }
         }
         t.unlocked.sort();
+        t.harnesses = per_harness(self.sessions.values());
         t
     }
+}
+
+/// Sums per harness over `entries`, most sessions first (then by name).
+pub fn per_harness<'a>(entries: impl Iterator<Item = &'a Entry>) -> Vec<HarnessTotals> {
+    let mut out: Vec<HarnessTotals> = Vec::new();
+    for e in entries {
+        let i = match out.iter().position(|h| h.harness == e.harness()) {
+            Some(i) => i,
+            None => {
+                out.push(HarnessTotals { harness: e.harness().to_string(), ..HarnessTotals::default() });
+                out.len() - 1
+            }
+        };
+        let h = &mut out[i];
+        h.sessions += 1;
+        h.agents += e.agents;
+        h.cost += e.cost;
+        h.tokens += e.tokens;
+        h.work_ms += if e.work_ms > 0 { e.work_ms } else { e.roster.iter().map(|a| a.ms).sum() };
+    }
+    out.sort_by(|a, b| b.sessions.cmp(&a.sessions).then_with(|| a.harness.cmp(&b.harness)));
+    out
 }
 
 #[cfg(test)]
@@ -249,6 +306,40 @@ mod tests {
         .unwrap();
         let e = &st.sessions["x"];
         assert_eq!((e.cost, e.started, e.hours.len(), e.roster.len()), (1.5, 0, 0, 0));
+    }
+
+    /// Entries record their harness; files written before the field existed
+    /// still load, and count as Claude Code in the per-harness sums.
+    #[test]
+    fn harness_is_recorded_and_old_entries_count_as_claude() {
+        let mut st: Store = serde_json::from_str(
+            r#"{"sessions":{"old":{"cost":1.0,"tokens":10,"agents":2,"cache_saved":0.0,"achievements":[],"fastest_ms":null}}}"#,
+        )
+        .unwrap();
+        assert_eq!((st.sessions["old"].harness.as_str(), st.sessions["old"].harness()), ("", "claude"));
+        let mut s = session("cx", 0.5);
+        s.harness = Some(crate::schema::Harness::Codex);
+        s.agents[0].uses.push(crate::model::Use { time: 5, tool: "bash".into(), file: None, edit: false, arg: String::new() });
+        st.record(&s, 10_000);
+        let mut c = session("cl", 0.25);
+        c.harness = Some(crate::schema::Harness::Claude);
+        st.record(&c, 10_000);
+        assert_eq!(st.sessions["cx"].harness, "codex");
+        assert_eq!(st.sessions["cx"].tool_calls, 1);
+
+        let t = st.totals();
+        let names: Vec<(&str, usize)> = t.harnesses.iter().map(|h| (h.harness.as_str(), h.sessions)).collect();
+        assert_eq!(names, [("claude", 2), ("codex", 1)]);
+        let claude = &t.harnesses[0];
+        assert_eq!(claude.agents, 3);
+        assert!((claude.cost - 1.25).abs() < 1e-9);
+        assert_eq!(t.harnesses[1].work_ms, 4_000);
+
+        // written back, the old entry still has no harness field; the new ones do
+        let json = serde_json::to_string(&st).unwrap();
+        assert_eq!(json.matches("\"harness\"").count(), 2, "{json}");
+        let back: Store = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.totals(), t);
     }
 
     #[test]

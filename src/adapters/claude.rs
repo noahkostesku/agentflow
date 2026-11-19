@@ -23,11 +23,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde_json::Value;
 
 use super::{is_test_command, iso_to_ms, now_ms, tail, SourceAdapter};
-use crate::discovery::Resolved;
 use crate::schema::{Body, Event, Harness, ToolKind, MAIN};
 
 #[cfg(test)]
@@ -69,6 +69,8 @@ pub struct ClaudeAdapter {
     subagents_dir: PathBuf,
     started: bool,
     subs: HashMap<String, Sub>,
+    /// the main thread's own tool-call bookkeeping
+    main: Sub,
     /// agentId -> spawn tool_use id, for subagent files already linked
     linked: HashMap<String, String>,
 }
@@ -116,6 +118,7 @@ impl ClaudeAdapter {
             main_offset: 0,
             started: false,
             subs: HashMap::new(),
+            main: Sub::default(),
             linked: HashMap::new(),
         }
     }
@@ -128,101 +131,158 @@ impl ClaudeAdapter {
     /// and the orchestrator's billed calls.
     fn scan_main(&mut self, out: &mut Vec<Event>) {
         for line in tail(&self.main_path, &mut self.main_offset) {
-            let spawn_line = line.contains("\"name\":\"Agent\"") || line.contains("\"name\":\"Task\"");
-            let result_line =
-                line.contains("tool_result") && self.subs.keys().any(|id| line.contains(id.as_str()));
-            let usage_line = line.contains("\"usage\"");
-            if !spawn_line && !result_line && !usage_line {
-                continue;
+            let before = out.len();
+            self.main_line(&line, out);
+            self.spawns(&line, out);
+            // nothing else said the main thread was alive: a heartbeat does
+            let quiet = !out[before..].iter().any(|e| e.agent() == Some(MAIN));
+            if let (true, Some(ts)) = (quiet && !line.contains("\"isSidechain\":true"), quick_timestamp(&line)) {
+                out.push(self.ev(ts, Body::Heartbeat { agent: MAIN.into() }));
             }
-            let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            let ts = v.get("timestamp").and_then(Value::as_str).and_then(iso_to_ms);
-            let at = ts.unwrap_or_else(now_ms);
-            let Some(content) = v.pointer("/message/content").and_then(Value::as_array) else {
-                continue;
-            };
-            match v.get("type").and_then(Value::as_str) {
-                Some("assistant") => {
-                    // Older builds inlined subagent turns as sidechains; those
-                    // are counted from the subagent side, not here.
-                    if v.get("isSidechain").and_then(Value::as_bool) != Some(true) {
-                        if let Some(b) = usage_body(&v, MAIN) {
-                            out.push(self.ev(at, b));
-                        }
+        }
+    }
+
+    /// The main thread's own work: its tool calls, billed calls and text
+    /// (like a subagent's), the user's prompts (its task), and the end of
+    /// each turn.
+    fn main_line(&mut self, line: &str, out: &mut Vec<Event>) {
+        let session = self.session.clone();
+        let ev = |ts: i64, body: Body| Event::new(Harness::Claude, &session, ts, body);
+        sub_line(line, MAIN, &mut self.main, out, &ev, true);
+        let prompt_line = line.contains("\"type\":\"user\"") && !line.contains("tool_result");
+        if !prompt_line && !line.contains("\"end_turn\"") {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            return;
+        }
+        let at = v.get("timestamp").and_then(Value::as_str).and_then(iso_to_ms).unwrap_or_else(now_ms);
+        match v.get("type").and_then(Value::as_str) {
+            // what the user typed (not tool results, meta or command output)
+            Some("user") if v.get("isMeta").and_then(Value::as_bool) != Some(true) => {
+                let Some(text) = v.pointer("/message/content").and_then(prompt_text) else {
+                    return;
+                };
+                out.push(ev(
+                    at,
+                    Body::AgentSpawned {
+                        agent: MAIN.into(),
+                        parent: None,
+                        role: String::new(),
+                        tag: String::new(),
+                        agent_type: String::new(),
+                        task: String::new(),
+                        prompt: text,
+                        alias: String::new(),
+                        ids: Vec::new(),
+                    },
+                ));
+            }
+            Some("assistant") if v.pointer("/message/stop_reason").and_then(Value::as_str) == Some("end_turn") => {
+                let text = v.pointer("/message/content").map(content_text).unwrap_or_default();
+                let body = Body::AgentFinished {
+                    agent: MAIN.into(),
+                    bytes: Some(text.len() as u64),
+                    result: (!text.trim().is_empty()).then_some(text),
+                    error: false,
+                };
+                out.push(ev(at, body));
+            }
+            _ => {}
+        }
+    }
+
+    /// Spawns, and the results of known spawns, from a main-transcript line.
+    fn spawns(&mut self, line: &str, out: &mut Vec<Event>) {
+        let spawn_line = line.contains("\"name\":\"Agent\"") || line.contains("\"name\":\"Task\"");
+        let result_line =
+            line.contains("tool_result") && self.subs.keys().any(|id| line.contains(id.as_str()));
+        if !spawn_line && !result_line {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        let ts = v.get("timestamp").and_then(Value::as_str).and_then(iso_to_ms);
+        let at = ts.unwrap_or_else(now_ms);
+        let Some(content) = v.pointer("/message/content").and_then(Value::as_array) else {
+            return;
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("assistant") => {
+                for block in content {
+                    let name = block.get("name").and_then(Value::as_str);
+                    if block.get("type").and_then(Value::as_str) != Some("tool_use")
+                        || !matches!(name, Some("Agent") | Some("Task"))
+                    {
+                        return;
                     }
-                    for block in content {
-                        let name = block.get("name").and_then(Value::as_str);
-                        if block.get("type").and_then(Value::as_str) != Some("tool_use")
-                            || !matches!(name, Some("Agent") | Some("Task"))
-                        {
-                            continue;
-                        }
-                        let Some(id) = block.get("id").and_then(Value::as_str) else {
-                            continue;
+                    let Some(id) = block.get("id").and_then(Value::as_str) else {
+                        return;
+                    };
+                    let input = block.get("input");
+                    let field = |k: &str| {
+                        input
+                            .and_then(|i| i.get(k))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let sub = self.ensure(id, &field("subagent_type"), &field("description"));
+                    if sub.prompt.is_empty() {
+                        sub.prompt = field("prompt");
+                    }
+                    if sub.alias.is_empty() {
+                        sub.alias = field("name");
+                    }
+                    self.announce(id, at, true, out);
+                }
+            }
+            Some("user") => {
+                let tur = v.get("toolUseResult");
+                let agent_id = tur.and_then(|t| t.get("agentId")).and_then(Value::as_str);
+                let launched = tur
+                    .and_then(|t| t.get("status"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains("launched"));
+                for block in content {
+                    if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                        return;
+                    }
+                    let Some(id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                        return;
+                    };
+                    if !self.subs.contains_key(id) {
+                        return;
+                    }
+                    if let Some(aid) = agent_id {
+                        self.link(aid, id, out);
+                    }
+                    // A non-launch result is a foreground agent returning.
+                    if !launched {
+                        let error = block.get("is_error").and_then(Value::as_bool) == Some(true);
+                        let len = block.get("content").map_or(0, |c| c.to_string().len());
+                        let text = block.get("content").map(content_text);
+                        let Some(sub) = self.subs.get_mut(id) else {
+                            return;
                         };
-                        let input = block.get("input");
-                        let field = |k: &str| {
-                            input
-                                .and_then(|i| i.get(k))
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string()
+                        sub.finished = true;
+                        // a handback already carried the result: keep it
+                        let fresh = !sub.handed_back;
+                        let body = Body::AgentFinished {
+                            agent: id.to_string(),
+                            result: text.filter(|_| fresh),
+                            bytes: fresh.then_some(len as u64),
+                            error,
                         };
-                        let sub = self.ensure(id, &field("subagent_type"), &field("description"));
-                        if sub.prompt.is_empty() {
-                            sub.prompt = field("prompt");
-                        }
-                        if sub.alias.is_empty() {
-                            sub.alias = field("name");
-                        }
-                        self.announce(id, at, true, out);
+                        out.push(self.ev(at, body));
                     }
                 }
-                Some("user") => {
-                    let tur = v.get("toolUseResult");
-                    let agent_id = tur.and_then(|t| t.get("agentId")).and_then(Value::as_str);
-                    let launched = tur
-                        .and_then(|t| t.get("status"))
-                        .and_then(Value::as_str)
-                        .is_some_and(|s| s.contains("launched"));
-                    for block in content {
-                        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-                            continue;
-                        }
-                        let Some(id) = block.get("tool_use_id").and_then(Value::as_str) else {
-                            continue;
-                        };
-                        if !self.subs.contains_key(id) {
-                            continue;
-                        }
-                        if let Some(aid) = agent_id {
-                            self.link(aid, id, out);
-                        }
-                        // A non-launch result is a foreground agent returning.
-                        if !launched {
-                            let error = block.get("is_error").and_then(Value::as_bool) == Some(true);
-                            let len = block.get("content").map_or(0, |c| c.to_string().len());
-                            let text = block.get("content").map(content_text);
-                            let Some(sub) = self.subs.get_mut(id) else {
-                                continue;
-                            };
-                            sub.finished = true;
-                            // a handback already carried the result: keep it
-                            let fresh = !sub.handed_back;
-                            let body = Body::AgentFinished {
-                                agent: id.to_string(),
-                                result: text.filter(|_| fresh),
-                                bytes: fresh.then_some(len as u64),
-                                error,
-                            };
-                            out.push(self.ev(at, body));
-                        }
-                    }
-                }
-                _ => {}
             }
+            _ => {}
         }
     }
 
@@ -340,7 +400,7 @@ impl ClaudeAdapter {
                     sub.last_ts = Some(sub.last_ts.map_or(ts, |l| l.max(ts)));
                 }
                 let before = batch.len();
-                sub_line(&line, &agent, sub, &mut batch, &ev);
+                sub_line(&line, &agent, sub, &mut batch, &ev, false);
                 // nothing else said it was active: a heartbeat does
                 let quiet = batch[before..].iter().all(|e| matches!(e.body, Body::AgentFinished { .. }));
                 if let (true, Some(ts)) = (quiet, qts) {
@@ -395,6 +455,7 @@ impl ClaudeAdapter {
             agent: tool_use_id.to_string(),
             parent: Some(MAIN.to_string()),
             role,
+            tag: String::new(),
             agent_type: sub.agent_type.clone(),
             task: sub.description.clone(),
             prompt: sub.prompt.clone(),
@@ -406,7 +467,7 @@ impl ClaudeAdapter {
 }
 
 /// One subagent transcript line → events for `agent`.
-fn sub_line(line: &str, agent: &str, sub: &mut Sub, out: &mut Vec<Event>, ev: &dyn Fn(i64, Body) -> Event) {
+fn sub_line(line: &str, agent: &str, sub: &mut Sub, out: &mut Vec<Event>, ev: &dyn Fn(i64, Body) -> Event, main: bool) {
     // tool_use blocks, tool_result blocks (which carry "tool_use_id"),
     // and billed assistant messages
     if !line.contains("tool_use") && !line.contains("\"usage\"") {
@@ -415,6 +476,11 @@ fn sub_line(line: &str, agent: &str, sub: &mut Sub, out: &mut Vec<Event>, ev: &d
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return;
     };
+    // Older builds inlined subagent turns in the main transcript as
+    // sidechains; those are read from the subagent side, not as main's.
+    if main && v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
     let ts = v.get("timestamp").and_then(Value::as_str).and_then(iso_to_ms);
     let at = ts.unwrap_or_else(now_ms);
     let rejected = v.pointer("/permissionDecision/decision").and_then(Value::as_str) == Some("reject");
@@ -591,6 +657,36 @@ fn touched_file(name: &str, block: &Value) -> Option<String> {
         .find_map(|p| block.pointer(p).and_then(Value::as_str))
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// What the user typed, from a user entry's `content`: a string or text
+/// blocks (never tool results). Claude Code's own wrappers (slash-command
+/// echoes, command output, reminders) aren't prompts; pasted text is, minus
+/// its `<pasted_content>` tags.
+fn prompt_text(c: &Value) -> Option<String> {
+    let raw = match c {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) if parts.iter().all(|p| p.get("type").and_then(Value::as_str) != Some("tool_result")) => {
+            content_text(c)
+        }
+        _ => return None,
+    };
+    let t = raw.trim_start();
+    let harness = ["<command-", "<local-command-", "<bash-", "<system-reminder>", "<task-notification>"];
+    if harness.iter().any(|h| t.starts_with(h)) {
+        return None;
+    }
+    let text: String = raw
+        .lines()
+        .filter(|l| {
+            let l = l.trim();
+            !(l.starts_with("<pasted_content") || l.starts_with("</pasted_content"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 /// The text of a message `content` (a string, or an array of blocks whose
@@ -788,9 +884,169 @@ fn looks_researchy(desc: &str) -> bool {
         .any(|k| d.contains(k))
 }
 
+// ---- discovery ---------------------------------------------------------------
+//
+// Claude Code stores one directory per project under `~/.claude/projects/`,
+// named by replacing every non-alphanumeric char in the project's absolute
+// path with `-`. Inside are `<session-id>.jsonl` transcripts.
+
+/// A resolved transcript to watch.
+pub struct Resolved {
+    /// path to the `.jsonl` transcript
+    pub path: PathBuf,
+    /// absolute project directory this session belongs to (best effort)
+    pub project_dir: Option<PathBuf>,
+    /// true when we fell back to the global most-recent session
+    pub fell_back: bool,
+}
+
+/// `~/.claude/projects`.
+pub fn projects_root() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    Path::new(&home).join(".claude").join("projects")
+}
+
+/// Encode an absolute path to its project-directory name. Claude Code
+/// replaces each UTF-16 unit that isn't `[A-Za-z0-9]`, so a non-BMP char
+/// (emoji) becomes two dashes.
+pub fn encode_path(p: &Path) -> String {
+    p.to_string_lossy()
+        .chars()
+        .flat_map(|c| {
+            let n = if c.is_ascii_alphanumeric() { 0 } else { c.len_utf16() };
+            std::iter::repeat_n('-', n).chain((n == 0).then_some(c))
+        })
+        .collect()
+}
+
+/// The storage dir for a project. Very long paths get truncated (with a hash
+/// suffix) by Claude Code, so if the exact name is missing, accept a dir that
+/// starts with the encoded name's first 200 chars.
+fn project_dir(root: &Path, project: &Path) -> PathBuf {
+    let enc = encode_path(project);
+    let exact = root.join(&enc);
+    if exact.is_dir() || enc.len() <= 200 {
+        return exact;
+    }
+    let prefix = &enc[..200];
+    std::fs::read_dir(root)
+        .ok()
+        .and_then(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .find(|d| d.is_dir() && d.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(prefix)))
+        })
+        .unwrap_or(exact)
+}
+
+fn mtime(p: &Path) -> SystemTime {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// When a session last showed signs of life: the newest write to its main
+/// transcript *or* any of its subagent transcripts. Background agents keep
+/// writing to their own files while the main transcript sits quiet, so the
+/// main file's mtime alone would make a busy session look idle.
+pub fn activity(transcript: &Path) -> SystemTime {
+    let mut newest = mtime(transcript);
+    if let Ok(entries) = std::fs::read_dir(subagents_dir(transcript)) {
+        for e in entries.flatten() {
+            newest = newest.max(e.metadata().and_then(|m| m.modified()).unwrap_or(newest));
+        }
+    }
+    newest
+}
+
+/// Most recently active `.jsonl` session directly inside `dir`, if any.
+fn newest_jsonl(dir: &Path) -> Option<(PathBuf, SystemTime)> {
+    let mut best: Option<(PathBuf, SystemTime)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let when = activity(&path);
+        if best.as_ref().is_none_or(|(_, t)| when > *t) {
+            best = Some((path, when));
+        }
+    }
+    best
+}
+
+/// The session for `session` anywhere; else `project`'s newest; else, with
+/// `fallback`, the most recently active session across all projects.
+pub fn find(root: &Path, session: Option<&str>, project: Option<&Path>, fallback: bool) -> Option<Resolved> {
+
+    // 1. Explicit session id: search every project dir for "<id>.jsonl".
+    if let Some(id) = session {
+        for entry in std::fs::read_dir(root).ok()?.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let candidate = dir.join(format!("{id}.jsonl"));
+            if candidate.is_file() {
+                return Some(Resolved {
+                    path: candidate,
+                    project_dir: Some(dir),
+                    fell_back: false,
+                });
+            }
+        }
+        return None;
+    }
+
+    // 2. Session for the given project.
+    if let Some(dir) = project {
+        let proj_dir = project_dir(root, dir);
+        if let Some((path, _)) = newest_jsonl(&proj_dir) {
+            return Some(Resolved {
+                path,
+                project_dir: Some(dir.to_path_buf()),
+                fell_back: false,
+            });
+        }
+    }
+    if !fallback {
+        return None;
+    }
+
+    // 3. Fallback: most-recently-active session across all projects.
+    let mut best: Option<(PathBuf, PathBuf, SystemTime)> = None; // (jsonl, projdir, mtime)
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Some((path, when)) = newest_jsonl(&dir) {
+            if best.as_ref().is_none_or(|(_, _, t)| when > *t) {
+                best = Some((path, dir, when));
+            }
+        }
+    }
+    best.map(|(path, dir, _)| Resolved {
+        path,
+        project_dir: Some(dir),
+        fell_back: true,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoding_matches_claude_code() {
+        assert_eq!(
+            encode_path(Path::new("/Users/me/tools/agent_flow.v2")),
+            "-Users-me-tools-agent-flow-v2"
+        );
+        assert_eq!(encode_path(Path::new("/a/caf\u{e9}")), "-a-caf-");
+        assert_eq!(encode_path(Path::new("/a/\u{1F600}")), "-a---", "emoji is two UTF-16 units");
+    }
+
 
     #[test]
     fn general_purpose_uses_role_prefix() {
@@ -1003,6 +1259,60 @@ mod tests {
         assert!(s.events.iter().any(|e| e.label == "reviewer \u{2192} fixer" && e.detail.starts_with("findings")));
     }
 
+    /// No subagents: the main thread is the one working row ("claude"), its
+    /// task is the user's prompt, a turn's end finishes it, the next tool call
+    /// reopens it, and its first spawn makes it the orchestrator.
+    #[test]
+    fn solo_session_main_is_the_working_row() {
+        let dir = std::env::temp_dir().join(format!("aflow-solo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("solo.jsonl");
+        let turn1 = [
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/w","message":{"content":"run the tests please"}}"#,
+            r#"{"type":"user","isMeta":true,"timestamp":"2026-01-01T00:00:00.100Z","message":{"content":"<system-reminder>x</system-reminder>"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"id":"a1","model":"claude-opus-5-5","stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5},"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:03.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"b1","content":"ok"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:04.000Z","message":{"id":"a2","model":"claude-opus-5-5","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5},"content":[{"type":"text","text":"All green."}]}}"#,
+        ];
+        std::fs::write(&main, turn1.join("\n") + "\n").unwrap();
+        let resolved = Resolved { path: main.clone(), project_dir: None, fell_back: false };
+        let mut live = Live::new(&resolved, "h".into());
+        live.refresh();
+        let s = live.build(&Pricing::default());
+        assert!(s.solo);
+        assert_eq!(s.agents.len(), 1);
+        let a = &s.agents[0];
+        assert_eq!((a.name.as_str(), a.model.as_str(), a.task.as_str()), ("claude", "opus", "run the tests please"));
+        assert_eq!(a.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["cargo"]);
+        assert_eq!(a.tests.iter().map(|t| t.passed).collect::<Vec<_>>(), [true]);
+        assert_eq!(a.calls.len(), 2, "its own billed calls");
+        assert!(s.orch_calls.is_empty());
+        assert_eq!(a.result.as_deref(), Some("All green."), "the turn ended");
+        assert!(a.finish.is_some());
+
+        // next turn: a new prompt and a tool call reopen it
+        let turn2 = [
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:10.000Z","message":{"content":"now lint it"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:11.000Z","message":{"id":"a3","model":"claude-opus-5-5","stop_reason":"tool_use","content":[{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"cargo clippy"}}]}}"#,
+        ];
+        std::fs::write(&main, std::fs::read_to_string(&main).unwrap() + &turn2.join("\n") + "\n").unwrap();
+        live.refresh();
+        let s = live.build(&Pricing::default());
+        let a = &s.agents[0];
+        assert!(a.finish.is_none(), "working again");
+        assert_eq!(a.task, "now lint it");
+
+        // a spawn: main becomes the orchestrator above the new subagent
+        let spawn = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:12.000Z","message":{"content":[{"type":"tool_use","id":"toolu_S","name":"Agent","input":{"subagent_type":"Explore","description":"map","prompt":"map it"}}]}}"#;
+        std::fs::write(&main, std::fs::read_to_string(&main).unwrap() + spawn + "\n").unwrap();
+        live.refresh();
+        let s = live.build(&Pricing::default());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!s.solo);
+        assert_eq!(s.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["scout"]);
+        assert_eq!(s.orch_calls.len(), 2, "main's billed calls are the orchestrator's now");
+    }
+
     #[test]
     fn team_message_shapes() {
         let msg = |input: Value| serde_json::json!({"type": "tool_use", "name": "SendMessage", "input": input});
@@ -1010,6 +1320,20 @@ mod tests {
         assert_eq!(team_message("SendMessage", &msg(serde_json::json!({"recipient": "qa", "content": "abc"}))), Some(("qa".into(), 3)));
         assert_eq!(team_message("SendMessage", &msg(serde_json::json!({"to": "*", "message": "all"}))), None, "broadcast");
         assert_eq!(team_message("Bash", &msg(serde_json::json!({"to": "qa"}))), None);
+    }
+
+    #[test]
+    fn prompts_are_what_the_user_typed() {
+        let s = |t: &str| prompt_text(&Value::String(t.into()));
+        assert_eq!(s("fix the parser").as_deref(), Some("fix the parser"));
+        assert_eq!(s("\n\n<pasted_content id=\"x\">\nGo ahead\n</pasted_content id=\"x\">").as_deref(), Some("Go ahead"));
+        assert_eq!(s("<command-name>/copy</command-name>"), None);
+        assert_eq!(s("<local-command-stdout>Copied</local-command-stdout>"), None);
+        assert_eq!(s("   "), None);
+        let blocks = serde_json::json!([{"type": "text", "text": "look at this"}, {"type": "image"}]);
+        assert_eq!(prompt_text(&blocks).as_deref(), Some("look at this"));
+        let result = serde_json::json!([{"type": "tool_result", "tool_use_id": "x", "content": "ok"}]);
+        assert_eq!(prompt_text(&result), None);
     }
 
     #[test]

@@ -19,10 +19,15 @@ these fields, plus the fields of its `type`:
 | field     | type    | meaning |
 |-----------|---------|---------|
 | `v`       | integer | schema version, `1` |
-| `harness` | string  | `claude` (more as adapters land) |
+| `harness` | string  | `claude`, `codex` |
 | `session` | string  | the harness's own session id |
 | `ts`      | integer | epoch milliseconds when it happened, as the harness recorded it |
 | `type`    | string  | one of the event types below |
+
+`agentflow events --json --source all` interleaves several sessions' events
+(one per harness); `harness` and `session` tell them apart, and the ordering
+rules below hold within each session. Adding a harness adds a `harness`
+value; see [adapters.md](adapters.md).
 
 Fields that are empty, `false`, or absent are omitted when serializing.
 Readers must ignore fields they don't know: new optional fields can appear
@@ -31,13 +36,16 @@ within v1. Removing a field or changing its meaning bumps `v`.
 ## Agents
 
 Most events name an `agent`: an id unique within the session. The session's
-top-level thread is always the agent **`main`**. It is never spawned.
+top-level thread is always the agent **`main`**. No agent spawns it, but an
+adapter may emit `agent_spawned` for `main` (with no `parent`) to record what
+the user asked as its `prompt`, again on each new prompt.
 
-- In a harness with subagents (`session_started.subagents: true`), `main` is
-  the orchestrator: its usage is the orchestrator's cost, and every other
-  agent is one of its subagents.
-- In a harness without subagents (`subagents: false`), `main` is the one
-  working agent.
+- Until any subagent spawns, `main` is **the working agent**: views show it
+  as one row named after the harness (`claude`, `codex`) under "you". It
+  finishes at the end of each turn (`agent_finished`) and its next
+  `tool_started` means it's working again.
+- Once a subagent spawns, `main` is **the orchestrator**: its usage is the
+  orchestrator's cost, and every other agent is one of its subagents.
 
 ## Ordering rules
 
@@ -62,7 +70,7 @@ A session began, or the adapter attached to it.
 | field       | type    | meaning |
 |-------------|---------|---------|
 | `cwd`       | string? | project directory the harness ran in |
-| `subagents` | bool    | the harness runs subagents under `main` |
+| `subagents` | bool    | the harness can run subagents under `main` (informational; the rule above decides how `main` is shown) |
 
 ```json
 {"v":1,"harness":"claude","session":"8f2c1e","ts":1795069298273,"type":"session_started","cwd":"/Users/me/code/parser","subagents":true}
@@ -76,7 +84,8 @@ A subagent was dispatched, or more became known about it (see rule 3).
 |--------------|-----------|---------|
 | `agent`      | string    | its id |
 | `parent`     | string?   | who dispatched it (usually `main`) |
-| `role`       | string    | display name: `scout`, `test-runner`, `reviewer`, … |
+| `role`       | string    | display name: `scout`, `test-runner`, `socrates`, … |
+| `tag`        | string?   | a short dim tag shown after the name where there's room (Codex: the agent's path, `repo_overview`) |
 | `agent_type` | string?   | the harness's own type (`Explore`, `general-purpose`, …) |
 | `task`       | string?   | short description of the assignment |
 | `prompt`     | string?   | the full prompt (handoff detection reads it) |
@@ -85,6 +94,18 @@ A subagent was dispatched, or more became known about it (see rule 3).
 
 ```json
 {"v":1,"harness":"claude","session":"8f2c1e","ts":1795069299000,"type":"agent_spawned","agent":"toolu_01A","parent":"main","role":"test-runner","agent_type":"general-purpose","task":"test-runner: run the parser tests","prompt":"Run cargo test and report failures.","ids":["a7f3"]}
+```
+
+A Codex subagent, named by its nickname with its path as the tag:
+
+```json
+{"v":1,"harness":"codex","session":"01a1f49c","ts":1795105275547,"type":"agent_spawned","agent":"01a1f49c-be7d","parent":"main","role":"socrates","tag":"repo_overview","task":"repo_overview","alias":"/root/repo_overview"}
+```
+
+What the user asked, recorded on `main` (no `parent`):
+
+```json
+{"v":1,"harness":"codex","session":"01a1f49c","ts":1795105271931,"type":"agent_spawned","agent":"main","role":"","prompt":"spawn 3 agents do a simple parallel task"}
 ```
 
 ### `tool_started`
@@ -189,7 +210,8 @@ don't record this rely on the `blocking` inference instead.
 
 ### `agent_finished`
 
-The agent finished and handed back.
+The agent finished and handed back. For `main` in a harness without
+subagents this ends a turn: its next `tool_started` means it's working again.
 
 | field    | type     | meaning |
 |----------|----------|---------|

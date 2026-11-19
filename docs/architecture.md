@@ -12,10 +12,10 @@ the schema.
   harness session files          adapters             normalized            consumers
   ─────────────────────          ────────             ──────────            ─────────
   ~/.claude/projects/…  ──►  claude adapter   ─┐                      ┌─►  tree / orbit / timeline
-  codex sessions        ──►  codex adapter    ─┤                      ├─►  stats · cost · parallelism
-  pi sessions           ──►  pi adapter       ─┼─►  event schema v1 ──┼─►  achievements · wrapped
-  opencode storage      ──►  opencode adapter ─┤    (session, agent,  └─►  `agentflow events --json`
-  gemini sessions       ──►  gemini adapter   ─┤     tool call,             (stdout, for other tools)
+  ~/.codex/sessions/…   ──►  codex adapter    ─┤                      ├─►  stats · cost · parallelism
+  (planned) pi          ──►  pi adapter       ─┼─►  event schema v1 ──┼─►  lifetime · achievements · wrapped
+  (planned) opencode    ──►  opencode adapter ─┤    (session, agent,  └─►  `agentflow events --json`
+  (planned) gemini      ──►  gemini adapter   ─┤     tool call,             (stdout, for other tools)
   (later) OTLP export   ──►  otel receiver    ─┘     handoff, usage,
                                                      done/error)
 ```
@@ -29,7 +29,9 @@ Only the schema.
 |-------|-------|-------|----------|
 | adapters | `src/adapters/<harness>.rs` | that harness's files | `schema::Event`s, via the `SourceAdapter` trait |
 | schema | `src/schema.rs` | | the event types (`docs/schema.md`) |
-| reducer | `src/live.rs` | schema events only | the render model (`model::Session`) |
+| discovery | `src/discovery.rs` | each adapter's `find` / `activity` | which session(s) to watch |
+| reducer | `src/live.rs` | schema events only | the render model (`model::Session`) for one session |
+| mixed view | `src/mixed.rs` | `model::Session`s | one `Session` with a group per harness |
 | consumers | `render.rs`, `orbit.rs`, `stats.rs`, `lifetime.rs`, `wrapped.rs` | `model::Session` only | frames, stats, lifetime history |
 
 `SourceAdapter::poll()` returns whatever is new on disk as events. The live
@@ -38,7 +40,39 @@ loop calls it about three times a second and folds the events into the
 script.
 
 Pricing is downstream too: `usage` events carry token counts and a model id,
-and `pricing.rs` turns them into dollars.
+and `pricing.rs` turns them into dollars at the provider's list prices
+(API-equivalent cost, not a bill).
 
-Discovery, finding which session to watch, is still Claude-only
-(`discovery.rs`). It becomes per-adapter when other harnesses land.
+## Discovery
+
+Each adapter knows where its harness stores sessions
+(`adapters::<harness>::find`, `activity`). `discovery.rs` picks among them:
+
+- **one session** (default, or `--source <harness>`): `--session` in
+  whichever harness has it, else the project's most recently active session
+  in any of the chosen harnesses, else the newest anywhere. Every ~2s it
+  looks again and hops to a newer session in the same directory.
+- **mixed** (`--source all`, `discovery::find_mixed`): each harness's most
+  recently active session for the project, keeping only those active in the
+  last 10 minutes; if none is, each harness's most recent. With none for the
+  project, the same rule over every project.
+
+## The mixed view
+
+`mixed::Mixed` holds one `live::Live` per harness. To draw a frame it builds
+each one with `Live::build_at(t0)`, where `t0` is the earliest start across
+them, so every harness's session is on one clock. `mixed::merge` then
+concatenates them into one `Session`:
+
+- `agents`, `orch_calls`, `events` and `handoffs` hold every harness's,
+  in group order (handoff indexes shifted), so totals, stats, achievements
+  and selection work across harnesses unchanged;
+- `groups` keeps each harness's own `Session` and where its agents start in
+  `agents`, so the views can draw a group per harness, each with its own
+  root (`orchestrator` or `you`), critical path and orbit ring.
+
+A single-session `Session` has no groups; views check `Session::mixed()`.
+
+Lifetime history is recorded per harness session, not per mixed view:
+`Mixed::parts` builds each session on its own clock, and each lifetime
+entry records its `harness`.

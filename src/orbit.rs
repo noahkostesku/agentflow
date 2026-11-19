@@ -1,7 +1,7 @@
 //! Orbit view (`v`): the orchestrator at the center, subagents evenly spaced
-//! on an elliptical ring around it. Port of docs/agentflow-orbit-mockup.html.
+//! on an elliptical ring around it. In a mixed view, one ring per harness.
 //!
-//! Why each element exists (from the mockup):
+//! Why each element exists:
 //!   * spokes + packets: dispatch and return between the orchestrator and each
 //!     agent, so you can see who is waiting on whom
 //!   * peer chords: real handoffs (one agent's result fed into another agent's
@@ -25,7 +25,7 @@ use crate::render::{clip, current_tool, idle_label, running_label, View, SPIN};
 use crate::stats;
 use crate::theme::*;
 
-/// Grid rows (the mockup's H). Its width is the frame width.
+/// Grid rows. Its width is the frame width.
 pub const GRID_H: usize = 20;
 /// Frame rows around the grid: header, top rule, bottom rule, latest, hints.
 pub const CHROME: usize = 5;
@@ -35,7 +35,7 @@ pub const MAX_RING: usize = 8;
 /// trace), anchored on the name row.
 const HALF: i64 = 6;
 
-// Timings (ms), from the mockup.
+// Timings (ms).
 const DISPATCH_MS: i64 = 500;
 const RETURN_MS: i64 = 500;
 const HANDOFF_MS: i64 = 600;
@@ -67,7 +67,7 @@ pub struct Layout {
 
 /// Lay out `n` agents on a `w`×`h` grid: evenly spaced on an ellipse starting
 /// at the top, ~3:1 wide to make up for ~2:1 tall character cells (the
-/// mockup's rx=24, ry=8 on 66×20). Takes the tallest ring whose label blocks
+/// design's rx=24, ry=8 on 66×20). Takes the tallest ring whose label blocks
 /// stay on the grid without touching each other or the orchestrator's;
 /// `None` when nothing fits (the caller falls back to the tree).
 pub fn layout(n: usize, w: usize, h: usize) -> Option<Layout> {
@@ -103,7 +103,7 @@ fn fits(pos: &[(i64, i64)], cx: i64, cy: i64, w: i64, h: i64) -> bool {
         && all.iter().enumerate().all(|(i, a)| all[i + 1..].iter().all(|b| !clash(*a, *b)))
 }
 
-/// Grid size for the frame: its width, the mockup's height, both shrunk to a
+/// Grid size for the frame: its width, `GRID_H` tall, both shrunk to a
 /// known terminal size (`(0, 0)` = unknown, e.g. debug frames and tests).
 pub fn grid_size(w: i64, term: (u16, u16)) -> (usize, usize) {
     let gw = if term.0 == 0 { w as usize } else { (w as usize).min(term.0 as usize) };
@@ -305,7 +305,7 @@ pub fn packets(sess: &Session, validators: &[String]) -> Vec<Packet> {
                 to: Some(i),
                 start: a.spawn,
                 dur: DISPATCH_MS,
-                label: format!("orchestrator \u{2192} {}", a.name),
+                label: format!("{} \u{2192} {}", sess.root_name(), a.name),
                 detail: "dispatch".into(),
             });
         }
@@ -322,7 +322,7 @@ pub fn packets(sess: &Session, validators: &[String]) -> Vec<Packet> {
             to: None,
             start: f,
             dur: if validator { VERDICT_MS } else { RETURN_MS },
-            label: format!("{} \u{2192} orchestrator", a.name),
+            label: format!("{} \u{2192} {}", a.name, sess.root_name()),
             detail,
         });
     }
@@ -417,6 +417,115 @@ fn steps(a: f64, b: f64, step: f64) -> impl Iterator<Item = f64> {
 /// doesn't fit the terminal.
 pub fn panel(sess: &Session, t: i64, view: &View, w: i64) -> Option<(Vec<Line<'static>>, Line<'static>)> {
     let (gw, gh) = grid_size(w, view.term);
+    let (grid, latest) = draw(sess, t, view, gw, gh)?;
+    Some((grid, latest_line(None, latest)))
+}
+
+/// Height of each ring when a mixed view stacks them.
+const STACK_H: usize = 14;
+
+/// The mixed view's orbit: one ring per harness, its name dim above it. Side
+/// by side when every ring fits half the width, else stacked when the
+/// terminal is tall enough, else `None` (the caller shows the tree). Returns
+/// the lines between the rules and the latest line (the newest across rings,
+/// tagged with its harness).
+pub fn mixed_panel(sess: &Session, t: i64, view: &View, w: i64) -> Option<(Vec<Line<'static>>, Line<'static>)> {
+    let n = sess.groups.len().max(1);
+    let cols = if view.term.0 == 0 { w as usize } else { (w as usize).min(view.term.0 as usize) };
+    let rows = if view.term.1 == 0 { usize::MAX } else { (view.term.1 as usize).saturating_sub(CHROME) };
+    let views: Vec<View> = sess.groups.iter().map(|g| View { selected: g.local(view.selected), ..*view }).collect();
+    let rings = |gw: usize, gh: usize| -> Option<Vec<(Vec<Line<'static>>, Option<Latest>)>> {
+        sess.groups.iter().zip(&views).map(|(g, v)| draw(&g.sess, t, v, gw, gh)).collect()
+    };
+    let latest = |drawn: &[(Vec<Line<'static>>, Option<Latest>)]| {
+        let newest = drawn
+            .iter()
+            .zip(&sess.groups)
+            .filter_map(|((_, l), g)| l.clone().map(|l| (g.harness.as_str(), l)))
+            .max_by_key(|(_, l)| l.0);
+        match newest {
+            Some((tag, l)) => latest_line(Some(tag), Some(l)),
+            None => Line::from(""),
+        }
+    };
+    // a harness name centered over its ring, padded to the ring's width
+    let label = |name: &str, width: usize| -> Span<'static> {
+        let name = clip(name, width);
+        let len = name.chars().count();
+        let left = (width - len) / 2;
+        Span::styled(format!("{}{name}{}", " ".repeat(left), " ".repeat(width - len - left)), Style::default().fg(D))
+    };
+
+    // side by side
+    let cw = cols.saturating_sub(n - 1) / n;
+    let gh = GRID_H.min(rows.saturating_sub(1));
+    if let Some(drawn) = rings(cw, gh) {
+        let mut out = vec![Line::from(
+            sess.groups
+                .iter()
+                .enumerate()
+                .flat_map(|(k, g)| {
+                    let gap = (k > 0).then(|| Span::raw(" "));
+                    gap.into_iter().chain([label(&g.harness, cw)])
+                })
+                .collect::<Vec<_>>(),
+        )];
+        for r in 0..gh {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for (k, (grid, _)) in drawn.iter().enumerate() {
+                if k > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                let line = grid.get(r).cloned().unwrap_or_default();
+                let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+                spans.extend(line.spans);
+                if k + 1 < drawn.len() {
+                    spans.push(Span::raw(" ".repeat(cw.saturating_sub(used))));
+                }
+            }
+            out.push(Line::from(spans));
+        }
+        return Some((out, latest(&drawn)));
+    }
+
+    // stacked
+    let sh = STACK_H.min(rows.saturating_sub(n) / n);
+    let drawn = rings(cols, sh)?;
+    let mut out = Vec::new();
+    for ((grid, _), g) in drawn.iter().zip(&sess.groups) {
+        out.push(Line::from(label(&g.harness, cols)));
+        out.extend(grid.iter().cloned());
+    }
+    Some((out, latest(&drawn)))
+}
+
+/// The newest packet (or the all-done line): (time, label, detail).
+type Latest = (i64, String, String);
+
+/// " latest  [harness]  label  detail"
+fn latest_line(tag: Option<&str>, latest: Option<Latest>) -> Line<'static> {
+    let Some((_, label, detail)) = latest else {
+        return Line::from("");
+    };
+    let dc = if detail.contains('✓') {
+        ac()
+    } else if detail.contains('✗') || detail == "error" {
+        RED
+    } else {
+        G
+    };
+    let mut l = vec![Span::styled(" latest  ", Style::default().fg(D))];
+    if let Some(tag) = tag {
+        l.push(Span::styled(format!("{tag:<8}"), Style::default().fg(D)));
+    }
+    l.push(Span::styled(format!("{label:<30}"), Style::default().fg(B)));
+    l.push(Span::styled(detail, Style::default().fg(dc)));
+    Line::from(l)
+}
+
+/// Draw one ring on a `gw`×`gh` grid: the grid lines and what's latest, or
+/// `None` when the ring doesn't fit.
+fn draw(sess: &Session, t: i64, view: &View, gw: usize, gh: usize) -> Option<(Vec<Line<'static>>, Option<Latest>)> {
     let ring = ring_agents(sess, t, view.selected);
     let lay = layout(ring.len(), gw, gh)?;
     let (cx, cy) = (lay.cx, lay.cy);
@@ -508,7 +617,7 @@ pub fn panel(sess: &Session, t: i64, view: &View, w: i64) -> Option<(Vec<Line<'s
     };
     g.putc(cx, cy - 1, "◆", ac());
     g.putc(cx, cy, face, fc);
-    g.putc(cx, cy + 1, "orchestrator", B);
+    g.putc(cx, cy + 1, sess.root_name(), B);
     g.putc(cx, cy + 2, &status, sc);
 
     // 6. agents
@@ -533,28 +642,11 @@ pub fn panel(sess: &Session, t: i64, view: &View, w: i64) -> Option<(Vec<Line<'s
     }
 
     // latest: the most recent packet (or the all-done line)
-    let mut last = packets.iter().rfind(|p| p.start <= t).map(|p| (p.label.clone(), p.detail.clone()));
+    let mut last = packets.iter().rfind(|p| p.start <= t).map(|p| (p.start, p.label.clone(), p.detail.clone()));
     if done {
-        last = Some(("orchestrator".into(), "all agents done ✓".into()));
+        last = Some((sess.all, sess.root_name().into(), "all agents done ✓".into()));
     }
-    let latest = match last {
-        Some((label, detail)) => {
-            let dc = if detail.contains('✓') {
-                ac()
-            } else if detail.contains('✗') || detail == "error" {
-                RED
-            } else {
-                G
-            };
-            Line::from(vec![
-                Span::styled(" latest  ", Style::default().fg(D)),
-                Span::styled(format!("{label:<30}"), Style::default().fg(B)),
-                Span::styled(detail, Style::default().fg(dc)),
-            ])
-        }
-        None => Line::from(""),
-    };
-    Some((g.lines(), latest))
+    Some((g.lines(), last))
 }
 
 /// One agent's block: face, name color, status line, braille trace.
@@ -693,7 +785,7 @@ mod tests {
                 assert!(xs.abs() <= n as i64, "{n}: lopsided {xs}");
             }
         }
-        // the mockup's own geometry: 66×20 → center (33,10), rx 24, ry 8
+        // the original design's geometry: 66×20 → center (33,10), rx 24, ry 8
         let l = layout(5, 66, 20).unwrap();
         assert_eq!((l.cx, l.cy, l.rx, l.ry), (33, 10, 24.0, 8.0));
         assert_eq!(l.pos, vec![(33, 2), (56, 8), (47, 16), (19, 16), (10, 8)]);

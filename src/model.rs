@@ -1,18 +1,18 @@
-//! The data model the renderer draws. Both demo mode (scripted) and, later,
-//! live mode (parsed from transcripts) produce a `Session` that `render` consumes.
+//! The data model the renderer draws. Both demo mode (scripted) and live mode
+//! (parsed from transcripts) produce a `Session` that `render` consumes.
 
 use ratatui::style::Color;
 
 /// How an agent's current tool reads on its face.
 /// `Look` = reading/searching (eyes glance side to side).
 /// `Run`  = running a command (wide-eyed).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ToolKind {
     Look,
     Run,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Tool {
     pub name: String,
     pub kind: ToolKind,
@@ -27,11 +27,84 @@ impl Tool {
     }
 }
 
+/// Token counts from one API response's `usage` block.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Usage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    /// cache writes billed at the 5-minute rate
+    pub cache_write_5m: u64,
+    /// cache writes billed at the 1-hour rate
+    pub cache_write_1h: u64,
+}
+
+impl Usage {
+    pub fn add(&mut self, o: &Usage) {
+        self.input += o.input;
+        self.output += o.output;
+        self.cache_read += o.cache_read;
+        self.cache_write_5m += o.cache_write_5m;
+        self.cache_write_1h += o.cache_write_1h;
+    }
+    /// Field-wise max: the same message can be logged more than once as it
+    /// streams, and the latest copy carries the final counts.
+    pub fn max(&mut self, o: &Usage) {
+        self.input = self.input.max(o.input);
+        self.output = self.output.max(o.output);
+        self.cache_read = self.cache_read.max(o.cache_read);
+        self.cache_write_5m = self.cache_write_5m.max(o.cache_write_5m);
+        self.cache_write_1h = self.cache_write_1h.max(o.cache_write_1h);
+    }
+    pub fn cache_write(&self) -> u64 {
+        self.cache_write_5m + self.cache_write_1h
+    }
+    /// Every token processed (prompt side + output).
+    pub fn total(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write()
+    }
+}
+
+/// One billed model call (one assistant message).
+#[derive(Clone, Debug)]
+pub struct Call {
+    /// session ms
+    pub time: i64,
+    pub usage: Usage,
+    /// USD, priced when the session was built
+    pub cost: f64,
+    /// USD saved by cache reads vs. paying full input price for them
+    pub saved: f64,
+}
+
+/// One tool invocation, for stats (tool counts, files touched, edits).
+#[derive(Clone, Debug)]
+pub struct Use {
+    pub time: i64,
+    /// short lowercase tool name ("read", "edit", "bash", …)
+    pub tool: String,
+    /// file the tool read or wrote, if any
+    pub file: Option<String>,
+    /// it modified a file (edit / write / multiedit / notebookedit)
+    pub edit: bool,
+    /// short argument for the detail view ("cargo test", "render.rs", a host)
+    pub arg: String,
+}
+
+/// A test command's outcome.
+#[derive(Clone, Copy, Debug)]
+pub struct TestRun {
+    pub time: i64,
+    pub passed: bool,
+}
+
 /// One subagent spawned by the orchestrator.
 /// Times are milliseconds on the session clock.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Agent {
     pub name: String,
+    /// model family badge ("opus", "sonnet", "haiku", …); empty if unknown
+    pub model: String,
     /// when the orchestrator dispatched it
     pub spawn: i64,
     /// when it returned a result; `None` = still running (live, unknown end)
@@ -51,6 +124,47 @@ pub struct Agent {
     pub error: bool,
     /// when the error happened (session ms) — drives the brief error glitch
     pub error_at: Option<i64>,
+    /// billed model calls, in time order
+    pub calls: Vec<Call>,
+    /// tool invocations, in time order
+    pub uses: Vec<Use>,
+    /// test-command outcomes, in time order
+    pub tests: Vec<TestRun>,
+    /// what it was asked to do (the spawn's description, else the prompt's first line)
+    pub task: String,
+    /// its final answer, when known
+    pub result: Option<String>,
+    /// session ms of its latest transcript entry of any kind (live only; the
+    /// demo derives activity from its calls and tool uses)
+    pub last_seen: Option<i64>,
+}
+
+/// Rarity by model family: (glyph, name). haiku common, sonnet rare,
+/// opus/fable/mythos legendary.
+pub fn rarity(model: &str) -> Option<(&'static str, &'static str)> {
+    match model {
+        "haiku" => Some(("·", "common")),
+        "sonnet" => Some(("◆", "rare")),
+        "opus" | "fable" | "mythos" => Some(("✦", "legendary")),
+        _ => None,
+    }
+}
+
+impl Agent {
+    /// Calls billed by session time `t`.
+    pub fn calls_at(&self, t: i64) -> impl Iterator<Item = &Call> {
+        self.calls.iter().filter(move |c| c.time <= t)
+    }
+    pub fn cost_at(&self, t: i64) -> f64 {
+        self.calls_at(t).map(|c| c.cost).sum()
+    }
+    pub fn usage_at(&self, t: i64) -> Usage {
+        let mut u = Usage::default();
+        for c in self.calls_at(t) {
+            u.add(&c.usage);
+        }
+        u
+    }
 }
 
 /// A line in the scrolling handoff/tool log.
@@ -63,9 +177,12 @@ pub struct Event {
 }
 
 /// Everything the renderer needs for a frame, independent of where it came from.
+#[derive(Default)]
 pub struct Session {
     /// full header string, e.g. "agentflow // <project> // <hash>"
     pub header: String,
+    /// stable id for lifetime persistence (live: the transcript's session id)
+    pub id: Option<String>,
     pub agents: Vec<Agent>,
     pub events: Vec<Event>,
     /// moment all agents are done (max finish + 500ms); `i64::MAX` while any run
@@ -74,4 +191,32 @@ pub struct Session {
     pub length: i64,
     /// live mode: real elapsed seconds (×1) and real current tool; demo: ×3 + cycling
     pub live: bool,
+    /// the orchestrator's own model badge and billed calls
+    pub orch_model: String,
+    pub orch_calls: Vec<Call>,
+    /// epoch ms of session time 0 (live only): places activity in wall-clock hours
+    pub epoch0: Option<i64>,
+}
+
+impl Session {
+    /// Total session cost (orchestrator + every subagent) by time `t`.
+    pub fn cost_at(&self, t: i64) -> f64 {
+        let orch: f64 = self.orch_calls.iter().filter(|c| c.time <= t).map(|c| c.cost).sum();
+        orch + self.agents.iter().map(|a| a.cost_at(t)).sum::<f64>()
+    }
+    /// Every call in the session (orchestrator first), by time `t`.
+    pub fn all_calls_at(&self, t: i64) -> impl Iterator<Item = &Call> {
+        self.orch_calls
+            .iter()
+            .chain(self.agents.iter().flat_map(|a| a.calls.iter()))
+            .filter(move |c| c.time <= t)
+    }
+    /// Elapsed-time multiplier: the demo runs ×3 for liveliness.
+    pub fn scale(&self) -> f64 {
+        if self.live {
+            1.0
+        } else {
+            3.0
+        }
+    }
 }

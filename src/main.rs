@@ -2,19 +2,24 @@
 //! sessions. `--demo` replays the scripted mockup; default watches a live
 //! session's transcripts.
 
+mod config;
 mod demo;
 mod discovery;
+mod lifetime;
 mod model;
+mod pricing;
 mod render;
+mod stats;
 mod theme;
 mod transcript;
+mod wrapped;
 
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use clap::{Parser, Subcommand};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::{cursor, execute, terminal};
 use ratatui::layout::Rect;
 use ratatui::prelude::CrosstermBackend;
@@ -22,9 +27,14 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 
-use render::W;
+use config::Config;
+use pricing::Pricing;
+use render::{Panel, View};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
+
+/// How long the key-hint footer stays up (on startup and after `?`).
+const HINT: Duration = Duration::from_secs(3);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -49,6 +59,18 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     project: Option<String>,
 
+    /// Turn off achievement popups (overrides config).
+    #[arg(long)]
+    no_achievements: bool,
+
+    /// Turn off the recap card (overrides config).
+    #[arg(long)]
+    no_recap: bool,
+
+    /// Hide costs: per-agent column, header total, and flashes (overrides config).
+    #[arg(long)]
+    no_cost: bool,
+
     /// Debug: render a single frame at the given ms and print it, then exit.
     #[arg(long, value_name = "MS", hide = true)]
     frame: Option<i64>,
@@ -60,65 +82,161 @@ struct Cli {
     /// Debug: render a synthetic live frame (active + just-finished) at the given ms.
     #[arg(long, value_name = "MS", hide = true)]
     synth: Option<i64>,
+
+    /// Debug: panel for --frame / --probe (main, stats, timeline, lifetime, detail).
+    #[arg(long, value_name = "NAME", hide = true)]
+    panel: Option<String>,
+
+    /// Debug: selected agent index for --frame / --probe.
+    #[arg(long, value_name = "N", hide = true)]
+    select: Option<usize>,
+
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Your agents, wrapped: six animated slides from your lifetime history
+    /// (space / → next, ← back, q quit).
+    Wrapped {
+        /// Only the last 7 days.
+        #[arg(long, conflicts_with_all = ["month", "all"])]
+        week: bool,
+        /// Only the last 30 days (the default).
+        #[arg(long, conflicts_with = "all")]
+        month: bool,
+        /// Everything on record.
+        #[arg(long)]
+        all: bool,
+        /// Write the outro card as an SVG (1200×675, sized for X) and exit.
+        #[arg(long, value_name = "FILE")]
+        export: Option<PathBuf>,
+        /// Debug: print slide N (1–6) at --at ms, then exit.
+        #[arg(long, value_name = "N", hide = true)]
+        slide: Option<usize>,
+        /// Debug: animation time for --slide.
+        #[arg(long, value_name = "MS", hide = true, default_value_t = 10_000)]
+        at: i64,
+    },
+}
+
+/// Settings resolved from config + CLI.
+struct Settings {
+    cfg: Config,
+    pricing: Pricing,
+}
+
+impl Settings {
+    fn view<'a>(&self, calm: bool, panel: Panel, lifetime: Option<&'a lifetime::Totals>) -> View<'a> {
+        View {
+            calm,
+            cost: self.cfg.cost,
+            flashes: self.cfg.cost && self.cfg.flashes,
+            achievements: self.cfg.achievements,
+            recap: false,
+            panel,
+            footer: false,
+            lifetime: if self.cfg.persistence { lifetime } else { None },
+            selected: None,
+            stuck_ms: self.cfg.stuck_after.saturating_mul(1000).min(i64::MAX as u64) as i64,
+        }
+    }
 }
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let mut rng = rand::thread_rng();
 
-    let cwd = cli
-        .project
-        .as_ref()
-        .map(PathBuf::from)
+    let (mut cfg, warning) = Config::load_or_create(&config::dir());
+    cfg.achievements &= !cli.no_achievements;
+    cfg.recap &= !cli.no_recap;
+    cfg.cost &= !cli.no_cost;
+    theme::set_accent(cfg.accent_rgb());
+    let set = Settings { pricing: Pricing::new(&cfg.pricing), cfg };
+    if let Some(w) = &warning {
+        eprintln!("agentflow: {w}");
+    }
+
+    // `--project` as Claude Code sees it: absolute, symlinks resolved, no
+    // trailing slash (it names the storage dir after the real cwd).
+    let project = cli.project.as_deref().map(discovery::normalize_project);
+    let cwd = project
+        .clone()
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
 
+    if let Some(Cmd::Wrapped { week, all, export, slide, at, .. }) = &cli.cmd {
+        let range = if *week {
+            wrapped::Range::Week
+        } else if *all {
+            wrapped::Range::All
+        } else {
+            wrapped::Range::Month
+        };
+        return run_wrapped(range, export.as_deref(), slide.map(|n| (n, *at)));
+    }
+
+    let panel = match cli.panel.as_deref() {
+        Some("stats") => Panel::Stats,
+        Some("timeline") => Panel::Timeline,
+        Some("lifetime") => Panel::Lifetime,
+        Some("detail") => Panel::Detail,
+        _ => Panel::Main,
+    };
+    let store = lifetime::Store::load(&lifetime::path());
+    let totals = store.totals();
+    // Debug frames: show what the UI would at that moment.
+    let debug_view = |sess: &model::Session, t: i64, app_t: i64| View {
+        recap: set.cfg.recap && render::recap_due(sess, t),
+        footer: app_t < HINT.as_millis() as i64,
+        selected: cli.select,
+        ..set.view(cli.calm, panel, Some(&totals))
+    };
+
     if let Some(ms) = cli.synth {
         let sess = demo::synth(header_for(&cwd));
-        print_ansi(&render::frame(&sess, ms, ms, cli.calm, &mut rng));
+        print_ansi(&render::frame(&sess, ms, ms, &debug_view(&sess, ms, ms), &mut rng));
         return Ok(());
     }
 
     // --- Demo mode -------------------------------------------------------
     if cli.demo {
-        let sess = demo::session(header_for(&cwd));
+        let sess = demo::session(header_for(&cwd), &set.pricing);
         if let Some(ms) = cli.frame {
-            print_ansi(&render::frame(&sess, ms, ms, cli.calm, &mut rng));
+            print_ansi(&render::frame(&sess, ms, ms, &debug_view(&sess, ms, ms), &mut rng));
             return Ok(());
         }
         if let Some(n) = cli.probe {
             for i in 0..n {
                 let ms = (sess.length * i as i64) / n.max(1) as i64;
                 println!("--- t={ms}ms ---");
-                print_ansi(&render::frame(&sess, ms, ms, cli.calm, &mut rng));
+                print_ansi(&render::frame(&sess, ms, ms, &debug_view(&sess, ms, ms), &mut rng));
                 println!();
             }
             return Ok(());
         }
-        return run_demo(&sess, cli.calm);
+        return finish(run_demo(&sess, &set, cli.calm), warning);
     }
 
     // --- Live mode -------------------------------------------------------
-    let resolved = discovery::resolve(
-        cli.session.as_deref(),
-        cli.project.as_deref().map(Path::new),
-    );
+    let resolved = discovery::resolve(cli.session.as_deref(), project.as_deref());
     match resolved {
         Some(r) => {
             let live = open_live(&r, &cwd);
             if let Some(ms) = cli.frame {
-                let sess = live.build();
+                let sess = live.build(&set.pricing);
                 let t = live.clock();
-                print_ansi(&render::frame(&sess, t, ms, cli.calm, &mut rng));
+                print_ansi(&render::frame(&sess, t, ms, &debug_view(&sess, t, ms), &mut rng));
                 return Ok(());
             }
             // Follow newer sessions unless pinned to one with --session.
             let follow = cli.session.is_none().then(|| Follow {
-                project: cli.project.as_ref().map(PathBuf::from),
+                project: project.clone(),
                 cwd: cwd.clone(),
                 fell_back: r.fell_back,
             });
-            run_live(live, cli.calm, follow)
+            finish(run_live(live, &set, store, cli.calm, follow), warning)
         }
         None if cli.session.is_some() => {
             eprintln!(
@@ -130,14 +248,22 @@ fn main() -> io::Result<()> {
         None => {
             // Nothing to watch anywhere — fall back to the demo so the tool
             // still shows something recognizable.
-            let sess = demo::session(header_for(&cwd));
+            let sess = demo::session(header_for(&cwd), &set.pricing);
             if let Some(ms) = cli.frame {
-                print_ansi(&render::frame(&sess, ms, ms, cli.calm, &mut rng));
+                print_ansi(&render::frame(&sess, ms, ms, &debug_view(&sess, ms, ms), &mut rng));
                 return Ok(());
             }
-            run_demo(&sess, cli.calm)
+            finish(run_demo(&sess, &set, cli.calm), warning)
         }
     }
+}
+
+/// Repeat a config warning after the TUI exits (the alternate screen hid it).
+fn finish(res: io::Result<()>, warning: Option<String>) -> io::Result<()> {
+    if let Some(w) = warning {
+        eprintln!("agentflow: {w}");
+    }
+    res
 }
 
 /// Attach to a resolved session and read what's already on disk. The header
@@ -219,12 +345,13 @@ fn leave(term: &mut Term) -> io::Result<()> {
     execute!(term.backend_mut(), terminal::LeaveAlternateScreen, cursor::Show)
 }
 
-/// Draw the 16-line frame centered in the terminal.
-fn paint(term: &mut Term, lines: Vec<Line<'static>>) -> io::Result<()> {
+/// Draw the frame centered in the terminal.
+fn paint(term: &mut Term, lines: Vec<Line<'static>>, width: i64) -> io::Result<()> {
+    let height = (lines.len() as u16).max(render::H);
     term.draw(|f| {
         let area = f.area();
-        let bw = (W as u16).min(area.width);
-        let bh = 16u16.min(area.height);
+        let bw = (width as u16).min(area.width);
+        let bh = height.min(area.height);
         let x = area.x + area.width.saturating_sub(bw) / 2;
         let y = area.y + area.height.saturating_sub(bh) / 2;
         f.render_widget(Paragraph::new(lines), Rect::new(x, y, bw, bh));
@@ -232,15 +359,150 @@ fn paint(term: &mut Term, lines: Vec<Line<'static>>) -> io::Result<()> {
     Ok(())
 }
 
+// ---- shared UI state (panels, hints, recap) ---------------------------------
+
+struct Ui {
+    calm: bool,
+    panel: Panel,
+    /// when the key hints were last asked for (startup counts)
+    hint_at: Instant,
+    /// the `all` value whose recap was dismissed, so a later batch of agents
+    /// gets its own recap
+    recap_dismissed: Option<i64>,
+    /// selected agent (index into `Session::agents`)
+    selected: Option<usize>,
+}
+
+enum Key {
+    Quit,
+    /// the UI handled it
+    Done,
+    /// mode-specific key (demo: space/r; live: r)
+    Other(KeyCode),
+}
+
+impl Ui {
+    fn new(calm: bool) -> Self {
+        Ui { calm, panel: Panel::Main, hint_at: Instant::now(), recap_dismissed: None, selected: None }
+    }
+
+    fn recap_showing(&self, set: &Settings, sess: &model::Session, t: i64) -> bool {
+        set.cfg.recap
+            && self.panel == Panel::Main
+            && render::recap_due(sess, t)
+            && self.recap_dismissed != Some(sess.all)
+    }
+
+    fn view<'a>(&self, set: &Settings, sess: &model::Session, t: i64, life: Option<&'a lifetime::Totals>) -> View<'a> {
+        View {
+            recap: self.recap_showing(set, sess, t),
+            footer: self.hint_at.elapsed() < HINT,
+            selected: self.selected.filter(|i| *i < sess.agents.len()),
+            ..set.view(self.calm, self.panel, life)
+        }
+    }
+
+    fn key(&mut self, k: KeyEvent, set: &Settings, sess: &model::Session, t: i64) -> Key {
+        let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c');
+        if ctrl_c {
+            return Key::Quit;
+        }
+        // Any key dismisses the recap card (and does nothing else).
+        if self.recap_showing(set, sess, t) {
+            self.recap_dismissed = Some(sess.all);
+            return Key::Done;
+        }
+        let toggle = |cur: Panel, p: Panel| if cur == p { Panel::Main } else { p };
+        match k.code {
+            KeyCode::Char('q') => Key::Quit,
+            KeyCode::Esc if self.panel != Panel::Main => {
+                self.panel = Panel::Main;
+                Key::Done
+            }
+            KeyCode::Esc if self.selected.is_some() => {
+                self.selected = None;
+                Key::Done
+            }
+            KeyCode::Esc => Key::Quit,
+            KeyCode::Up | KeyCode::Down => {
+                self.step(k.code == KeyCode::Down, sess, t);
+                Key::Done
+            }
+            KeyCode::Enter => {
+                if self.selected.is_none() {
+                    self.step(true, sess, t);
+                }
+                if self.selected.is_some() {
+                    self.panel = Panel::Detail;
+                }
+                Key::Done
+            }
+            KeyCode::Char('c') => {
+                self.calm = !self.calm;
+                Key::Done
+            }
+            KeyCode::Char('s') => {
+                self.panel = toggle(self.panel, Panel::Stats);
+                Key::Done
+            }
+            KeyCode::Char('t') => {
+                self.panel = toggle(self.panel, Panel::Timeline);
+                Key::Done
+            }
+            KeyCode::Char('l') => {
+                self.panel = toggle(self.panel, Panel::Lifetime);
+                Key::Done
+            }
+            KeyCode::Char('?') | KeyCode::Char('h') => {
+                self.hint_at = Instant::now();
+                Key::Done
+            }
+            other => Key::Other(other),
+        }
+    }
+}
+
+impl Ui {
+    /// Move the selection through the agents that have started, in spawn
+    /// order. With nothing selected, ↓ picks the first and ↑ the last.
+    fn step(&mut self, down: bool, sess: &model::Session, t: i64) {
+        let started: Vec<usize> = (0..sess.agents.len()).filter(|&i| sess.agents[i].spawn <= t).collect();
+        let Some(&last) = started.last() else {
+            return;
+        };
+        let pos = self.selected.and_then(|s| started.iter().position(|&i| i == s));
+        self.selected = Some(match (pos, down) {
+            (None, true) => started[0],
+            (None, false) => last,
+            (Some(p), true) => started[(p + 1).min(started.len() - 1)],
+            (Some(p), false) => started[p.saturating_sub(1)],
+        });
+    }
+}
+
+/// Next key press within `timeout`, ignoring releases.
+fn next_key(timeout: Duration) -> io::Result<Option<KeyEvent>> {
+    if event::poll(timeout)? {
+        if let Event::Key(k) = event::read()? {
+            if k.kind != KeyEventKind::Release {
+                return Ok(Some(k));
+            }
+        }
+    }
+    Ok(None)
+}
+
 // ---- demo loop (looping clock, pause/restart) ------------------------------
 
-fn run_demo(sess: &model::Session, mut calm: bool) -> io::Result<()> {
+fn run_demo(sess: &model::Session, set: &Settings, calm: bool) -> io::Result<()> {
     let mut term = enter()?;
     let mut rng = rand::thread_rng();
+    let mut ui = Ui::new(calm);
     let length = sess.length.max(1);
     let mut offset: i64 = 0;
     let mut since = Instant::now();
     let mut running = true;
+    let mut last_t = 0;
 
     let res = (|| -> io::Result<()> {
         loop {
@@ -251,34 +513,33 @@ fn run_demo(sess: &model::Session, mut calm: bool) -> io::Result<()> {
                     0
                 })
                 % length;
-            paint(&mut term, render::frame(sess, t, t, calm, &mut rng))?;
-            if event::poll(Duration::from_millis(50))? {
-                if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Release {
-                        continue;
-                    }
-                    let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(k.code, KeyCode::Char('c'));
-                    match k.code {
-                        _ if ctrl_c => break,
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char(' ') => {
-                            if running {
-                                offset = (offset + since.elapsed().as_millis() as i64) % length;
-                                running = false;
-                            } else {
-                                since = Instant::now();
-                                running = true;
-                            }
-                        }
-                        KeyCode::Char('r') => {
-                            offset = 0;
-                            since = Instant::now();
-                        }
-                        KeyCode::Char('c') => calm = !calm,
-                        _ => {}
+            if t < last_t {
+                ui.recap_dismissed = None; // new loop: the recap comes back
+            }
+            last_t = t;
+            let view = ui.view(set, sess, t, None);
+            paint(&mut term, render::frame(sess, t, t, &view, &mut rng), render::width(&view))?;
+            let Some(k) = next_key(Duration::from_millis(50))? else {
+                continue;
+            };
+            match ui.key(k, set, sess, t) {
+                Key::Quit => break,
+                Key::Done => {}
+                Key::Other(KeyCode::Char(' ')) => {
+                    if running {
+                        offset = (offset + since.elapsed().as_millis() as i64) % length;
+                        running = false;
+                    } else {
+                        since = Instant::now();
+                        running = true;
                     }
                 }
+                Key::Other(KeyCode::Char('r')) => {
+                    offset = 0;
+                    since = Instant::now();
+                    ui.recap_dismissed = None;
+                }
+                Key::Other(_) => {}
             }
         }
         Ok(())
@@ -290,17 +551,52 @@ fn run_demo(sess: &model::Session, mut calm: bool) -> io::Result<()> {
 
 // ---- live loop (real clock, refresh from disk ~3x/sec) ---------------------
 
+/// Lifetime persistence for live mode: an in-memory store updated on every
+/// refresh, written to disk when a batch of agents finishes and on exit.
+struct Persist {
+    on: bool,
+    store: lifetime::Store,
+    totals: lifetime::Totals,
+    dirty: bool,
+}
+
+impl Persist {
+    fn update(&mut self, sess: &model::Session, t: i64) {
+        if !self.on || !self.store.record(sess, t) {
+            return;
+        }
+        self.totals = self.store.totals();
+        self.dirty = true;
+        if sess.all != i64::MAX && t >= sess.all {
+            self.flush();
+        }
+    }
+    fn flush(&mut self) {
+        if self.on && self.dirty {
+            // Best effort: a read-only home just means no lifetime file.
+            let _ = self.store.save(&lifetime::path());
+            self.dirty = false;
+        }
+    }
+}
+
 fn run_live(
     mut live: transcript::Live,
-    mut calm: bool,
+    set: &Settings,
+    store: lifetime::Store,
+    calm: bool,
     mut follow: Option<Follow>,
 ) -> io::Result<()> {
     let mut term = enter()?;
     let mut rng = rand::thread_rng();
+    let mut ui = Ui::new(calm);
     let mut app_start = Instant::now();
     let mut last_refresh = Instant::now();
     let mut last_scan = Instant::now();
-    let mut sess = live.build();
+    let mut sess = live.build(&set.pricing);
+    let totals = store.totals();
+    let mut persist = Persist { on: set.cfg.persistence, store, totals, dirty: false };
+    persist.update(&sess, live.clock());
 
     let res = (|| -> io::Result<()> {
         loop {
@@ -309,44 +605,105 @@ fn run_live(
                 last_scan = Instant::now();
                 if let Some(fw) = follow.as_mut() {
                     if let Some(next) = newer_session(fw, live.path()) {
+                        persist.flush();
                         fw.fell_back = next.fell_back;
                         live = open_live(&next, &fw.cwd);
-                        sess = live.build();
+                        sess = live.build(&set.pricing);
                         app_start = Instant::now(); // replay the header intro
+                        ui.selected = None;
+                        ui.panel = Panel::Main;
                     }
                 }
             }
             if last_refresh.elapsed() >= Duration::from_millis(300) {
                 live.refresh();
-                sess = live.build();
+                sess = live.build(&set.pricing);
+                persist.update(&sess, live.clock());
                 last_refresh = Instant::now();
             }
             let t = live.clock();
             let app_t = app_start.elapsed().as_millis() as i64;
-            paint(&mut term, render::frame(&sess, t, app_t, calm, &mut rng))?;
-            if event::poll(Duration::from_millis(50))? {
-                if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Release {
-                        continue;
-                    }
-                    let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(k.code, KeyCode::Char('c'));
-                    match k.code {
-                        _ if ctrl_c => break,
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('c') => calm = !calm,
-                        KeyCode::Char('r') => {
-                            live.refresh();
-                            sess = live.build();
-                        }
-                        _ => {}
-                    }
+            let view = ui.view(set, &sess, t, Some(&persist.totals));
+            paint(&mut term, render::frame(&sess, t, app_t, &view, &mut rng), render::width(&view))?;
+            let Some(k) = next_key(Duration::from_millis(50))? else {
+                continue;
+            };
+            match ui.key(k, set, &sess, t) {
+                Key::Quit => break,
+                Key::Done => {}
+                Key::Other(KeyCode::Char('r')) => {
+                    live.refresh();
+                    sess = live.build(&set.pricing);
                 }
+                Key::Other(_) => {}
             }
         }
         Ok(())
     })();
 
+    persist.flush();
+    leave(&mut term)?;
+    res
+}
+
+// ---- wrapped -----------------------------------------------------------------
+
+/// `agentflow wrapped`: aggregate lifetime history (or demo data when there
+/// is none in range), then export, print a debug slide, or play the slides.
+fn run_wrapped(range: wrapped::Range, export: Option<&Path>, debug: Option<(usize, i64)>) -> io::Result<()> {
+    let store = lifetime::Store::load(&lifetime::path());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    let mut w = wrapped::aggregate(&store, range, now);
+    if w.sessions == 0 {
+        w = wrapped::demo(range);
+    }
+
+    if let Some(path) = export {
+        std::fs::write(path, wrapped::svg(&w))?;
+        println!(
+            "agentflow: wrote {} (1200×675){}",
+            path.display(),
+            if w.demo { " · demo data, no history yet" } else { "" }
+        );
+        return Ok(());
+    }
+    if let Some((n, ms)) = debug {
+        print_ansi(&wrapped::slide(&w, n.clamp(1, wrapped::SLIDES) - 1, ms));
+        return Ok(());
+    }
+
+    let mut term = enter()?;
+    let mut i = 0usize;
+    let mut since = Instant::now();
+    let res = (|| -> io::Result<()> {
+        loop {
+            let ms = since.elapsed().as_millis() as i64;
+            paint(&mut term, wrapped::slide(&w, i, ms), wrapped::CW as i64 + 2)?;
+            let Some(k) = next_key(Duration::from_millis(33))? else {
+                continue;
+            };
+            let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c');
+            match k.code {
+                _ if ctrl_c => break,
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char(' ') | KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => {
+                    if i + 1 >= wrapped::SLIDES {
+                        break;
+                    }
+                    i += 1;
+                    since = Instant::now();
+                }
+                KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
+                    i = i.saturating_sub(1);
+                    since = Instant::now();
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })();
     leave(&mut term)?;
     res
 }
@@ -381,6 +738,65 @@ mod tests {
         }
         let f = File::create(path).unwrap();
         f.set_modified(SystemTime::now() - Duration::from_secs(secs_ago)).unwrap();
+    }
+
+    #[test]
+    fn keys_dismiss_recap_then_toggle_panels() {
+        let cfg = Config::default();
+        let set = Settings { pricing: Pricing::new(&cfg.pricing), cfg };
+        let sess = demo::session("h".into(), &set.pricing);
+        let press = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+        let mut ui = Ui::new(false);
+        let done = sess.all + render::RECAP_DELAY;
+
+        // recap up: the first key (even q) only dismisses it
+        assert!(ui.recap_showing(&set, &sess, done));
+        assert!(matches!(ui.key(press(KeyCode::Char('q')), &set, &sess, done), Key::Done));
+        assert!(!ui.recap_showing(&set, &sess, done));
+        assert_eq!(ui.panel, Panel::Main);
+
+        // panels toggle; Esc backs out of a panel before it quits
+        ui.key(press(KeyCode::Char('s')), &set, &sess, done);
+        assert_eq!(ui.panel, Panel::Stats);
+        ui.key(press(KeyCode::Char('t')), &set, &sess, done);
+        assert_eq!(ui.panel, Panel::Timeline);
+        ui.key(press(KeyCode::Char('t')), &set, &sess, done);
+        assert_eq!(ui.panel, Panel::Main);
+        ui.key(press(KeyCode::Char('l')), &set, &sess, done);
+        assert!(matches!(ui.key(press(KeyCode::Esc), &set, &sess, done), Key::Done));
+        assert_eq!(ui.panel, Panel::Main);
+        assert!(matches!(ui.key(press(KeyCode::Esc), &set, &sess, done), Key::Quit));
+
+        // recap off in config: never shows
+        let mut set2 = Settings { pricing: set.pricing.clone(), cfg: Config::default() };
+        set2.cfg.recap = false;
+        assert!(!Ui::new(false).recap_showing(&set2, &sess, done));
+        // ↑/↓ select, Enter opens the detail panel, Esc backs out, Esc again clears
+        let mut ui = Ui::new(false);
+        let mid = 6_000; // all three demo agents have started
+        ui.key(press(KeyCode::Down), &set, &sess, mid);
+        assert_eq!(ui.selected, Some(0));
+        ui.key(press(KeyCode::Down), &set, &sess, mid);
+        ui.key(press(KeyCode::Down), &set, &sess, mid);
+        ui.key(press(KeyCode::Down), &set, &sess, mid);
+        assert_eq!(ui.selected, Some(2), "clamps at the last agent");
+        ui.key(press(KeyCode::Up), &set, &sess, mid);
+        assert_eq!(ui.selected, Some(1));
+        ui.key(press(KeyCode::Enter), &set, &sess, mid);
+        assert_eq!(ui.panel, Panel::Detail);
+        ui.key(press(KeyCode::Esc), &set, &sess, mid);
+        assert_eq!((ui.panel, ui.selected), (Panel::Main, Some(1)));
+        ui.key(press(KeyCode::Esc), &set, &sess, mid);
+        assert_eq!(ui.selected, None);
+        // before anyone spawns there's nothing to select
+        let mut ui = Ui::new(false);
+        ui.key(press(KeyCode::Enter), &set, &sess, 0);
+        assert_eq!((ui.panel, ui.selected), (Panel::Main, None));
+
+        // ctrl-c always quits, recap or not
+        let mut ui = Ui::new(false);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(ui.key(ctrl_c, &set, &sess, done), Key::Quit));
     }
 
     /// Synthetic ~/.claude/projects: a stale session and a fresh one in the same

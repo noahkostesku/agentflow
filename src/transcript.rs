@@ -27,7 +27,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::discovery::Resolved;
-use crate::model::{Agent, Event, Session, Tool, ToolKind};
+use crate::model::{Agent, Call, Event, Session, TestRun, Tool, ToolKind, Use, Usage};
+use crate::pricing::{self, Pricing};
 use crate::theme;
 
 /// A tool call that hasn't returned this long reads as "waiting". We can't see
@@ -59,7 +60,23 @@ struct Acc {
     sub_path: Option<PathBuf>,
     sub_offset: u64,
     order: usize,
+    /// latest model id seen in its transcript
+    model: String,
+    /// billed calls keyed by message id (one message is logged once per
+    /// content block, each copy repeating the same usage)
+    usage: Usage_,
+    uses: Vec<Use>,
+    /// tool_use ids of Bash calls that ran a test command
+    test_ids: HashSet<String>,
+    tests: Vec<TestRun>,
+    /// final answer (handback message or foreground result)
+    result: Option<String>,
+    /// latest assistant text, the fallback result preview
+    last_text: String,
 }
+
+/// message id -> (first seen ms, usage, model)
+type Usage_ = HashMap<String, (i64, Usage, String)>;
 
 pub struct Live {
     header: String,
@@ -73,6 +90,11 @@ pub struct Live {
     next_order: usize,
     /// when we started watching (clock origin until the first spawn)
     opened: i64,
+    /// the orchestrator's own model and billed calls
+    orch_model: String,
+    orch_usage: Usage_,
+    /// the session's project dir: touched files are shown relative to it
+    root: Option<String>,
 }
 
 impl Live {
@@ -80,6 +102,7 @@ impl Live {
         let main_path = resolved.path.clone();
         Live {
             header,
+            root: read_cwd(&main_path).map(|p| p.to_string_lossy().trim_end_matches('/').to_string() + "/"),
             subagents_dir: subagents_dir(&main_path),
             main_path,
             main_offset: 0,
@@ -87,6 +110,8 @@ impl Live {
             linked: HashMap::new(),
             next_order: 0,
             opened: now_ms(),
+            orch_model: String::new(),
+            orch_usage: HashMap::new(),
         }
     }
 
@@ -107,7 +132,8 @@ impl Live {
             let spawn_line = line.contains("\"name\":\"Agent\"") || line.contains("\"name\":\"Task\"");
             let result_line =
                 line.contains("tool_result") && self.accs.keys().any(|id| line.contains(id.as_str()));
-            if !spawn_line && !result_line {
+            let usage_line = line.contains("\"usage\"");
+            if !spawn_line && !result_line && !usage_line {
                 continue;
             }
             let Ok(v) = serde_json::from_str::<Value>(&line) else {
@@ -119,6 +145,11 @@ impl Live {
             };
             match v.get("type").and_then(Value::as_str) {
                 Some("assistant") => {
+                    // Older builds inlined subagent turns as sidechains; those
+                    // are counted from the subagent side, not here.
+                    if v.get("isSidechain").and_then(Value::as_bool) != Some(true) {
+                        record_usage(&v, ts, &mut self.orch_model, &mut self.orch_usage);
+                    }
                     for block in content {
                         let name = block.get("name").and_then(Value::as_str);
                         if block.get("type").and_then(Value::as_str) != Some("tool_use")
@@ -177,6 +208,9 @@ impl Live {
                                 acc.pending.clear();
                                 if acc.size.is_empty() {
                                     acc.size = human_size(len);
+                                }
+                                if let Some(text) = block.get("content").map(content_text) {
+                                    acc.result.get_or_insert(text);
                                 }
                                 if is_err {
                                     acc.denied = true;
@@ -281,18 +315,21 @@ impl Live {
             return;
         };
         for line in tail(&path, &mut acc.sub_offset) {
-            // tool_use blocks, and tool_result blocks (which carry "tool_use_id")
-            if !line.contains("tool_use") {
+            // Any entry at all is a sign of life (stuck detection), so take
+            // its timestamp before filtering, without a full parse.
+            if let Some(ts) = quick_timestamp(&line) {
+                acc.first_ts.get_or_insert(ts);
+                acc.last_ts = Some(acc.last_ts.map_or(ts, |l| l.max(ts)));
+            }
+            // tool_use blocks, tool_result blocks (which carry "tool_use_id"),
+            // and billed assistant messages
+            if !line.contains("tool_use") && !line.contains("\"usage\"") {
                 continue;
             }
             let Ok(v) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
             let ts = v.get("timestamp").and_then(Value::as_str).and_then(iso_to_ms);
-            if let Some(ts) = ts {
-                acc.first_ts.get_or_insert(ts);
-                acc.last_ts = Some(acc.last_ts.map_or(ts, |l| l.max(ts)));
-            }
             let rejected =
                 v.pointer("/permissionDecision/decision").and_then(Value::as_str) == Some("reject");
             let Some(content) = v.pointer("/message/content").and_then(Value::as_array) else {
@@ -300,6 +337,11 @@ impl Live {
             };
             match v.get("type").and_then(Value::as_str) {
                 Some("assistant") => {
+                    record_usage(&v, ts, &mut acc.model, &mut acc.usage);
+                    let text = content_text(&Value::Array(content.clone()));
+                    if !text.trim().is_empty() {
+                        acc.last_text = text;
+                    }
                     for block in content {
                         if block.get("type").and_then(Value::as_str) != Some("tool_use") {
                             continue;
@@ -316,6 +358,7 @@ impl Live {
                             acc.pending.clear();
                             if let Some(msg) = block.pointer("/input/message").and_then(Value::as_str) {
                                 acc.size = human_size(msg.len());
+                                acc.result = Some(msg.to_string());
                             }
                             continue;
                         }
@@ -331,6 +374,17 @@ impl Live {
                         if !id.is_empty() {
                             acc.pending.push((id.to_string(), tts, can_prompt(name)));
                         }
+                        acc.uses.push(Use {
+                            time: tts,
+                            tool: short_tool(name),
+                            file: touched_file(name, block),
+                            edit: is_edit(name),
+                            arg: short_arg(name, block),
+                        });
+                        let cmd = block.pointer("/input/command").and_then(Value::as_str);
+                        if name == "Bash" && !id.is_empty() && cmd.is_some_and(is_test_command) {
+                            acc.test_ids.insert(id.to_string());
+                        }
                     }
                 }
                 Some("user") => {
@@ -340,6 +394,13 @@ impl Live {
                         }
                         if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
                             acc.pending.retain(|(pid, _, _)| pid != id);
+                            // A Bash call that exits non-zero comes back is_error.
+                            if acc.test_ids.remove(id) && !is_denial(block) {
+                                acc.tests.push(TestRun {
+                                    time: noticed(ts).unwrap_or_else(now_ms),
+                                    passed: block.get("is_error").and_then(Value::as_bool) != Some(true),
+                                });
+                            }
                         }
                         if rejected || is_denial(block) {
                             acc.denied = true;
@@ -375,7 +436,7 @@ impl Live {
     }
 
     /// Build the render model for the current instant.
-    pub fn build(&self) -> Session {
+    pub fn build(&self, pricing: &Pricing) -> Session {
         let mut accs: Vec<&Acc> = self.accs.values().collect();
         accs.sort_by_key(|a| (a.spawn_ms.or(a.first_ts).unwrap_or(i64::MAX), a.order));
 
@@ -447,6 +508,7 @@ impl Live {
 
             agents.push(Agent {
                 name: role,
+                model: pricing::family(&a.model),
                 spawn,
                 finish,
                 wait,
@@ -456,6 +518,29 @@ impl Live {
                 bob: (a.order as i64) * 3,
                 error,
                 error_at,
+                calls: priced(&a.usage, t0, pricing),
+                uses: a
+                    .uses
+                    .iter()
+                    .map(|u| Use {
+                        time: u.time - t0,
+                        file: u.file.as_ref().map(|f| match &self.root {
+                            Some(r) => f.strip_prefix(r.as_str()).unwrap_or(f).to_string(),
+                            None => f.clone(),
+                        }),
+                        ..u.clone()
+                    })
+                    .collect(),
+                tests: a.tests.iter().map(|r| TestRun { time: r.time - t0, ..*r }).collect(),
+                task: if a.description.trim().is_empty() {
+                    a.prompt.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string()
+                } else {
+                    a.description.trim().to_string()
+                },
+                result: a.result.clone().or_else(|| {
+                    (a.finished && !a.last_text.trim().is_empty()).then(|| a.last_text.clone())
+                }),
+                last_seen: a.last_ts.map(|l| l - t0),
             });
         }
 
@@ -473,11 +558,15 @@ impl Live {
 
         Session {
             header: self.header.clone(),
+            id: self.main_path.file_stem().map(|s| s.to_string_lossy().into_owned()),
             agents,
             events,
             all,
             length: 0,
             live: true,
+            orch_model: pricing::family(&self.orch_model),
+            orch_calls: priced(&self.orch_usage, t0, pricing),
+            epoch0: Some(t0),
         }
     }
 
@@ -494,6 +583,151 @@ impl Live {
 }
 
 // ---- helpers ---------------------------------------------------------------
+
+/// Note an assistant entry's model and usage. The same message id appears
+/// once per content block; keep its first-seen time and the largest counts.
+fn record_usage(v: &Value, ts: Option<i64>, model: &mut String, calls: &mut Usage_) {
+    let Some(msg) = v.get("message") else {
+        return;
+    };
+    let m = msg.get("model").and_then(Value::as_str).unwrap_or("");
+    if !m.is_empty() && !m.starts_with('<') {
+        *model = m.to_string();
+    }
+    let Some(u) = msg.get("usage") else {
+        return;
+    };
+    let usage = parse_usage(u);
+    if usage == Usage::default() {
+        return;
+    }
+    let id = msg
+        .get("id")
+        .or_else(|| v.get("requestId"))
+        .or_else(|| v.get("uuid"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let time = noticed(ts).unwrap_or_else(now_ms);
+    let e = calls.entry(id).or_insert((time, Usage::default(), m.to_string()));
+    e.1.max(&usage);
+}
+
+/// An API `usage` object to token counts. Cache writes are split by TTL when
+/// the breakdown is present; otherwise all writes bill at the 5-minute rate.
+fn parse_usage(u: &Value) -> Usage {
+    let n = |p: &str| u.pointer(p).and_then(Value::as_u64).unwrap_or(0);
+    let writes = n("/cache_creation_input_tokens");
+    let (w5, w1) = match u.get("cache_creation") {
+        Some(_) => {
+            let w1 = n("/cache_creation/ephemeral_1h_input_tokens");
+            (writes.saturating_sub(w1), w1)
+        }
+        None => (writes, 0),
+    };
+    Usage {
+        input: n("/input_tokens"),
+        output: n("/output_tokens"),
+        cache_read: n("/cache_read_input_tokens"),
+        cache_write_5m: w5,
+        cache_write_1h: w1,
+    }
+}
+
+/// Usage map -> priced calls on the session clock, in time order.
+fn priced(calls: &Usage_, t0: i64, pricing: &Pricing) -> Vec<Call> {
+    let mut v: Vec<Call> = calls
+        .values()
+        .map(|(time, usage, model)| Call {
+            time: time - t0,
+            usage: *usage,
+            cost: pricing.cost(model, usage),
+            saved: pricing.cache_savings(model, usage),
+        })
+        .collect();
+    v.sort_by_key(|c| c.time);
+    v
+}
+
+/// Tools that modify files.
+fn is_edit(name: &str) -> bool {
+    matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
+}
+
+/// The file a file tool read or wrote (search tools take a directory, skip them).
+fn touched_file(name: &str, block: &Value) -> Option<String> {
+    if !matches!(name, "Read" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "NotebookRead") {
+        return None;
+    }
+    ["/input/file_path", "/input/notebook_path", "/input/path"]
+        .iter()
+        .find_map(|p| block.pointer(p).and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Stats name for a tool: lowercase; MCP tools keep only their own name.
+/// The text of a message `content` (a string, or an array of blocks whose
+/// `text` fields are joined).
+fn content_text(c: &Value) -> String {
+    match c {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// `"timestamp":"…"` from a raw line without parsing the JSON.
+fn quick_timestamp(line: &str) -> Option<i64> {
+    let i = line.find("\"timestamp\":\"")? + 13;
+    iso_to_ms(line.get(i..)?)
+}
+
+/// A few words saying what a tool call was about, for the detail view.
+fn short_arg(name: &str, block: &Value) -> String {
+    let get = |k: &str| block.pointer(&format!("/input/{k}")).and_then(Value::as_str).unwrap_or("");
+    let s = match name {
+        "Bash" => get("command").split_whitespace().take(3).collect::<Vec<_>>().join(" "),
+        "Read" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "NotebookRead" => {
+            let f = [get("file_path"), get("notebook_path"), get("path")]
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .unwrap_or("");
+            f.rsplit('/').next().unwrap_or(f).to_string()
+        }
+        "Grep" | "Glob" => get("pattern").to_string(),
+        "WebFetch" => {
+            let url = get("url");
+            let rest = url.split("://").nth(1).unwrap_or(url);
+            rest.split('/').next().unwrap_or(rest).to_string()
+        }
+        "WebSearch" => get("query").to_string(),
+        "Agent" | "Task" => get("description").to_string(),
+        _ => String::new(),
+    };
+    s.lines().next().unwrap_or("").to_string()
+}
+
+fn short_tool(name: &str) -> String {
+    name.rsplit("__").next().unwrap_or(name).to_lowercase()
+}
+
+/// A shell command that runs a test suite.
+fn is_test_command(cmd: &str) -> bool {
+    let c = cmd.to_lowercase();
+    [
+        "cargo test", "cargo nextest", "pytest", "py.test", "unittest", "npm test",
+        "npm run test", "yarn test", "pnpm test", "bun test", "deno test", "go test",
+        "jest", "vitest", "mocha", "rspec", "phpunit", "mix test", "ctest", "make test",
+        "make check", "gradle test", "mvn test", "dotnet test", "swift test", "tox",
+    ]
+    .iter()
+    .any(|k| c.contains(k))
+}
 
 /// `<dir>/<session-id>/subagents` beside a `<dir>/<session-id>.jsonl` transcript.
 pub fn subagents_dir(main: &Path) -> PathBuf {
@@ -808,7 +1042,7 @@ mod tests {
         let resolved = Resolved { path: main, project_dir: None, fell_back: false };
         let mut live = Live::new(&resolved, "h".into());
         live.refresh();
-        let s = live.build();
+        let s = live.build(&Pricing::default());
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(s.agents.len(), 2);
@@ -822,5 +1056,82 @@ mod tests {
         // the Bash call has been pending for "years" (2026-01-01): it's waiting
         assert!(tr.wait.is_some());
         assert!(sc.wait.is_none(), "reads never count as waiting");
+    }
+
+    /// Usage is deduped per message id (Claude Code logs one entry per content
+    /// block, each repeating the usage), priced by model, and tool activity
+    /// feeds files touched, edits, and test outcomes.
+    #[test]
+    fn usage_files_and_tests_from_a_subagent() {
+        let dir = std::env::temp_dir().join(format!("aflow-usage-{}", std::process::id()));
+        let sub = dir.join("sess").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let main = dir.join("sess.jsonl");
+        let lines = [
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","message":{"id":"m0","model":"claude-opus-5-5","usage":{"input_tokens":1000000,"output_tokens":0},"content":[{"type":"tool_use","id":"toolu_A","name":"Agent","input":{"subagent_type":"fixer","description":"fix","prompt":"fix it"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.100Z","toolUseResult":{"status":"async_launched","agentId":"q1"},"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_A","content":"launched"}]}}"#,
+        ];
+        std::fs::write(&main, lines.join("\n") + "\n").unwrap();
+        let sub_lines = [
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.200Z","message":{"content":"fix it"}}"#,
+            // one message, two content blocks: logged twice with the same usage
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"id":"m1","model":"claude-haiku-5-5","usage":{"input_tokens":0,"output_tokens":1000000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"running"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"id":"m1","model":"claude-haiku-5-5","usage":{"input_tokens":0,"output_tokens":1000000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"cargo test -q"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:02.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":true,"content":"Exit code 101\ntest failed"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03.000Z","message":{"id":"m2","model":"claude-haiku-5-5","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":1000000,"cache_creation_input_tokens":2000000,"cache_creation":{"ephemeral_5m_input_tokens":1000000,"ephemeral_1h_input_tokens":1000000}},"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/w/src/lib.rs","old_string":"a","new_string":"b"}},{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"cargo test -q"}}]}}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:04.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"e1","content":"ok"},{"type":"tool_result","tool_use_id":"b2","content":"test result: ok"}]}}"#,
+        ];
+        std::fs::write(sub.join("agent-q1.jsonl"), sub_lines.join("\n") + "\n").unwrap();
+
+        let resolved = Resolved { path: main, project_dir: None, fell_back: false };
+        let mut live = Live::new(&resolved, "h".into());
+        live.refresh();
+        let s = live.build(&Pricing::default());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(s.orch_model, "opus");
+        assert_eq!(s.orch_calls.len(), 1);
+        assert!((s.orch_calls[0].cost - 4.0).abs() < 1e-9, "1M opus input = $4");
+        let a = &s.agents[0];
+        assert_eq!(a.model, "haiku");
+        assert_eq!(a.calls.len(), 2, "duplicate message entries count once");
+        // m1: 1M haiku output = $0.50; m2: 1M read $0.01 + 1M 5m write $0.125 + 1M 1h write $0.20
+        assert!((a.calls[0].cost - 0.50).abs() < 1e-9);
+        assert!((a.calls[1].cost - 0.335).abs() < 1e-9);
+        assert!((a.calls[1].saved - 0.09).abs() < 1e-9);
+        assert_eq!(a.uses.iter().filter(|u| u.edit).count(), 1);
+        assert_eq!(a.uses.iter().find(|u| u.edit).unwrap().file.as_deref(), Some("/w/src/lib.rs"));
+        let outcomes: Vec<bool> = a.tests.iter().map(|r| r.passed).collect();
+        assert_eq!(outcomes, vec![false, true]);
+        assert!(crate::stats::unlocks(&s, i64::MAX - 1)
+            .iter()
+            .any(|u| u.kind == crate::stats::Kind::BugHunter));
+        assert_eq!(s.id.as_deref(), Some("sess"));
+        assert_eq!(a.task, "fix");
+        assert_eq!(a.uses.iter().map(|u| u.arg.as_str()).collect::<Vec<_>>(), ["cargo test -q", "lib.rs", "cargo test -q"]);
+        // the latest entry of any kind (here a tool_result at 00:00:04) is activity
+        assert_eq!(a.last_seen, Some(4_000));
+        assert!(a.result.is_none(), "still running: no result yet");
+    }
+
+    #[test]
+    fn quick_timestamp_and_content_text() {
+        assert_eq!(
+            quick_timestamp(r#"{"type":"user","timestamp":"1970-01-01T00:00:02.000Z","x":1}"#),
+            Some(2_000)
+        );
+        assert_eq!(quick_timestamp(r#"{"type":"user"}"#), None);
+        let v: Value = serde_json::json!([{"type":"text","text":"a"},{"type":"tool_use"},{"type":"text","text":"b"}]);
+        assert_eq!(content_text(&v), "a\nb");
+        assert_eq!(content_text(&Value::String("x".into())), "x");
+    }
+
+    #[test]
+    fn test_commands() {
+        assert!(is_test_command("cd x && cargo test --all"));
+        assert!(is_test_command("python -m pytest -q"));
+        assert!(is_test_command("npm run test -- --watch=false"));
+        assert!(!is_test_command("cargo build"));
+        assert!(!is_test_command("ls tests/"));
     }
 }

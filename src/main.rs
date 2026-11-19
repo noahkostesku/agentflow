@@ -2,17 +2,19 @@
 //! sessions. `--demo` replays the scripted mockup; default watches a live
 //! session's transcripts.
 
+mod adapters;
 mod config;
 mod demo;
 mod discovery;
 mod lifetime;
+mod live;
 mod model;
 mod orbit;
 mod pricing;
 mod render;
+mod schema;
 mod stats;
 mod theme;
-mod transcript;
 mod wrapped;
 
 use std::io::{self, Stdout, Write};
@@ -287,14 +289,17 @@ fn finish(res: io::Result<()>, warning: Option<String>) -> io::Result<()> {
 }
 
 /// Attach to a resolved session and read what's already on disk. The header
-/// uses the real cwd recorded in the transcript (handles --session and the
+/// uses the real cwd the session reported (handles --session and the
 /// fallback, where the storage dir name is path-encoded).
-fn open_live(r: &discovery::Resolved, cwd: &Path) -> transcript::Live {
-    let hdr_dir = transcript::read_cwd(&r.path)
+fn open_live(r: &discovery::Resolved, cwd: &Path) -> live::Live {
+    let mut live = live::Live::new(r, String::new());
+    live.refresh();
+    let hdr_dir = live
+        .cwd()
+        .map(PathBuf::from)
         .or_else(|| r.project_dir.clone())
         .unwrap_or_else(|| cwd.to_path_buf());
-    let mut live = transcript::Live::new(r, header_for(&hdr_dir));
-    live.refresh();
+    live.set_header(header_for(&hdr_dir));
     live
 }
 
@@ -637,7 +642,7 @@ impl Persist {
 }
 
 fn run_live(
-    mut live: transcript::Live,
+    mut live: live::Live,
     set: &Settings,
     store: lifetime::Store,
     calm: bool,

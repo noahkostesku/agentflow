@@ -1,4 +1,4 @@
-//! Live mode: turn a real Claude Code session on disk into a render `Session`.
+//! Claude Code adapter: a session's transcripts on disk → schema events.
 //!
 //! Format (observed):
 //!   * main transcript `<session>.jsonl` — the orchestrator. Each subagent spawn
@@ -15,131 +15,122 @@
 //!
 //! A running subagent file is linked to its spawn by (1) the `agentId` in the
 //! launch result, or (2) matching its first message against the spawn's prompt.
-//! Everything is keyed by the spawn's `tool_use` id. Timestamps are epoch ms;
-//! the render clock is `now - t0`, where `t0` is the earliest spawn.
-//!
-//! Handoffs (orbit chords) come from two places: a finished agent's result
-//! quoted in a later agent's prompt (`orbit::detect_handoffs`), and, for agent
-//! teams, a teammate's `SendMessage` call addressed to another teammate.
+//! Agents are keyed by the spawn's `tool_use` id; the orchestrator is
+//! `schema::MAIN`. Teammate `SendMessage` calls (agent teams) become
+//! `handoff` events.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use super::{is_test_command, iso_to_ms, now_ms, tail, SourceAdapter};
 use crate::discovery::Resolved;
-use crate::model::{Agent, Call, Event, Session, TestRun, Tool, ToolKind, Use, Usage};
-use crate::pricing::{self, Pricing};
-use crate::theme;
+use crate::schema::{Body, Event, Harness, ToolKind, MAIN};
 
-/// A tool call that hasn't returned this long reads as "waiting". We can't see
-/// *why* it's blocked (permission prompt vs. slow command), only that it is.
-const WAIT_MS: i64 = 10_000;
+#[cfg(test)]
+use crate::live::Live;
+#[cfg(test)]
+use crate::pricing::Pricing;
 
-/// Per-subagent accumulator, updated incrementally across refreshes.
+/// What we know about one subagent, keyed by its spawn's tool_use id.
 #[derive(Default)]
-struct Acc {
+struct Sub {
     agent_type: String,
     description: String,
     prompt: String,
-    spawn_ms: Option<i64>,
-    first_ts: Option<i64>,
-    last_ts: Option<i64>,
-    /// foreground agents: when the orchestrator received the final result
-    done_ts: Option<i64>,
-    finished: bool,
-    /// the agent's latest outcome was a denied/blocked tool call
-    denied: bool,
-    /// when the most recent denial happened (drives the error glitch)
-    error_ts: Option<i64>,
-    size: String,
-    tools: Vec<(i64, Tool)>,
-    /// tool_use ids already counted (guards against re-emitted entries)
-    seen: HashSet<String>,
-    /// outstanding tool calls with no result yet: (tool_use_id, ts, can_prompt)
-    pending: Vec<(String, i64, bool)>,
-    sub_path: Option<PathBuf>,
-    sub_offset: u64,
-    order: usize,
-    /// latest model id seen in its transcript
-    model: String,
-    /// billed calls keyed by message id (one message is logged once per
-    /// content block, each copy repeating the same usage)
-    usage: Usage_,
-    uses: Vec<Use>,
-    /// tool_use ids of Bash calls that ran a test command
-    test_ids: HashSet<String>,
-    tests: Vec<TestRun>,
-    /// final answer (handback message or foreground result)
-    result: Option<String>,
-    /// latest assistant text, the fallback result preview
-    last_text: String,
     /// teammate name given at spawn (`input.name`), for message routing
     alias: String,
-    /// direct teammate messages it sent: (ts, recipient, bytes)
-    messages: Vec<(i64, String, usize)>,
+    /// agentIds of its transcript
+    agent_ids: Vec<String>,
+    /// the last `agent_spawned` we emitted for it: (role, type, task, prompt,
+    /// alias, ids) — re-emitted when any of it changes
+    announced: Option<(String, String, String, String, String, usize)>,
+    sub_path: Option<PathBuf>,
+    sub_offset: u64,
+    /// tool_use ids already emitted (guards against re-emitted entries)
+    seen: HashSet<String>,
+    /// a SubagentHandback carried its result
+    handed_back: bool,
+    /// some finish was emitted for it
+    finished: bool,
+    /// its meta.json says finished
+    meta_finished: bool,
+    first_ts: Option<i64>,
+    last_ts: Option<i64>,
 }
 
-/// message id -> (first seen ms, usage, model)
-type Usage_ = HashMap<String, (i64, Usage, String)>;
-
-pub struct Live {
-    header: String,
+pub struct ClaudeAdapter {
+    session: String,
     main_path: PathBuf,
     main_offset: u64,
     subagents_dir: PathBuf,
-    /// keyed by the spawn's tool_use id
-    accs: HashMap<String, Acc>,
+    started: bool,
+    subs: HashMap<String, Sub>,
     /// agentId -> spawn tool_use id, for subagent files already linked
     linked: HashMap<String, String>,
-    next_order: usize,
-    /// when we started watching (clock origin until the first spawn)
-    opened: i64,
-    /// the orchestrator's own model and billed calls
-    orch_model: String,
-    orch_usage: Usage_,
-    /// the session's project dir: touched files are shown relative to it
-    root: Option<String>,
 }
 
-impl Live {
-    pub fn new(resolved: &Resolved, header: String) -> Self {
-        let main_path = resolved.path.clone();
-        Live {
-            header,
-            root: read_cwd(&main_path).map(|p| p.to_string_lossy().trim_end_matches('/').to_string() + "/"),
-            subagents_dir: subagents_dir(&main_path),
-            main_path,
-            main_offset: 0,
-            accs: HashMap::new(),
-            linked: HashMap::new(),
-            next_order: 0,
-            opened: now_ms(),
-            orch_model: String::new(),
-            orch_usage: HashMap::new(),
-        }
+impl From<&Resolved> for Box<dyn SourceAdapter> {
+    fn from(r: &Resolved) -> Self {
+        Box::new(ClaudeAdapter::open(&r.path))
+    }
+}
+
+impl SourceAdapter for ClaudeAdapter {
+    fn harness(&self) -> Harness {
+        Harness::Claude
     }
 
-    /// The transcript this watcher is attached to.
-    pub fn path(&self) -> &Path {
+    fn session_id(&self) -> &str {
+        &self.session
+    }
+
+    fn path(&self) -> &Path {
         &self.main_path
     }
 
-    /// Re-read what's new on disk. Cheap to call a few times per second.
-    pub fn refresh(&mut self) {
-        self.scan_main();
-        self.scan_subagents();
+    fn poll(&mut self) -> Vec<Event> {
+        let mut out = Vec::new();
+        if !self.started {
+            self.started = true;
+            let cwd = read_cwd(&self.main_path).map(|p| p.to_string_lossy().into_owned());
+            let ts = first_timestamp(&self.main_path).unwrap_or_else(now_ms);
+            out.push(self.ev(ts, Body::SessionStarted { cwd, subagents: true }));
+        }
+        self.scan_main(&mut out);
+        self.scan_subagents(&mut out);
+        out
+    }
+}
+
+impl ClaudeAdapter {
+    /// Watch the session whose main transcript is `main_path`.
+    pub fn open(main_path: &Path) -> Self {
+        ClaudeAdapter {
+            session: main_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            subagents_dir: subagents_dir(main_path),
+            main_path: main_path.to_path_buf(),
+            main_offset: 0,
+            started: false,
+            subs: HashMap::new(),
+            linked: HashMap::new(),
+        }
     }
 
-    /// Parse new main-transcript lines: spawns, and the results of known spawns.
-    fn scan_main(&mut self) {
+    fn ev(&self, ts: i64, body: Body) -> Event {
+        Event::new(Harness::Claude, &self.session, ts, body)
+    }
+
+    /// Parse new main-transcript lines: spawns, the results of known spawns,
+    /// and the orchestrator's billed calls.
+    fn scan_main(&mut self, out: &mut Vec<Event>) {
         for line in tail(&self.main_path, &mut self.main_offset) {
             let spawn_line = line.contains("\"name\":\"Agent\"") || line.contains("\"name\":\"Task\"");
             let result_line =
-                line.contains("tool_result") && self.accs.keys().any(|id| line.contains(id.as_str()));
+                line.contains("tool_result") && self.subs.keys().any(|id| line.contains(id.as_str()));
             let usage_line = line.contains("\"usage\"");
             if !spawn_line && !result_line && !usage_line {
                 continue;
@@ -148,6 +139,7 @@ impl Live {
                 continue;
             };
             let ts = v.get("timestamp").and_then(Value::as_str).and_then(iso_to_ms);
+            let at = ts.unwrap_or_else(now_ms);
             let Some(content) = v.pointer("/message/content").and_then(Value::as_array) else {
                 continue;
             };
@@ -156,7 +148,9 @@ impl Live {
                     // Older builds inlined subagent turns as sidechains; those
                     // are counted from the subagent side, not here.
                     if v.get("isSidechain").and_then(Value::as_bool) != Some(true) {
-                        record_usage(&v, ts, &mut self.orch_model, &mut self.orch_usage);
+                        if let Some(b) = usage_body(&v, MAIN) {
+                            out.push(self.ev(at, b));
+                        }
                     }
                     for block in content {
                         let name = block.get("name").and_then(Value::as_str);
@@ -176,17 +170,14 @@ impl Live {
                                 .unwrap_or("")
                                 .to_string()
                         };
-                        let atype = field("subagent_type");
-                        let acc = self.ensure(id, &atype, &field("description"));
-                        if acc.prompt.is_empty() {
-                            acc.prompt = field("prompt");
+                        let sub = self.ensure(id, &field("subagent_type"), &field("description"));
+                        if sub.prompt.is_empty() {
+                            sub.prompt = field("prompt");
                         }
-                        if acc.alias.is_empty() {
-                            acc.alias = field("name");
+                        if sub.alias.is_empty() {
+                            sub.alias = field("name");
                         }
-                        if acc.spawn_ms.is_none() {
-                            acc.spawn_ms = noticed(ts);
-                        }
+                        self.announce(id, at, true, out);
                     }
                 }
                 Some("user") => {
@@ -203,31 +194,30 @@ impl Live {
                         let Some(id) = block.get("tool_use_id").and_then(Value::as_str) else {
                             continue;
                         };
-                        if !self.accs.contains_key(id) {
+                        if !self.subs.contains_key(id) {
                             continue;
                         }
                         if let Some(aid) = agent_id {
-                            self.link(aid, id);
+                            self.link(aid, id, out);
                         }
                         // A non-launch result is a foreground agent returning.
                         if !launched {
-                            let is_err = block.get("is_error").and_then(Value::as_bool) == Some(true);
+                            let error = block.get("is_error").and_then(Value::as_bool) == Some(true);
                             let len = block.get("content").map_or(0, |c| c.to_string().len());
-                            if let Some(acc) = self.accs.get_mut(id) {
-                                acc.finished = true;
-                                acc.done_ts = noticed(ts);
-                                acc.pending.clear();
-                                if acc.size.is_empty() {
-                                    acc.size = human_size(len);
-                                }
-                                if let Some(text) = block.get("content").map(content_text) {
-                                    acc.result.get_or_insert(text);
-                                }
-                                if is_err {
-                                    acc.denied = true;
-                                    acc.error_ts = noticed(ts);
-                                }
-                            }
+                            let text = block.get("content").map(content_text);
+                            let Some(sub) = self.subs.get_mut(id) else {
+                                continue;
+                            };
+                            sub.finished = true;
+                            // a handback already carried the result: keep it
+                            let fresh = !sub.handed_back;
+                            let body = Body::AgentFinished {
+                                agent: id.to_string(),
+                                result: text.filter(|_| fresh),
+                                bytes: fresh.then_some(len as u64),
+                                error,
+                            };
+                            out.push(self.ev(at, body));
                         }
                     }
                 }
@@ -237,23 +227,24 @@ impl Live {
     }
 
     /// Point a spawn at its subagent transcript.
-    fn link(&mut self, agent_id: &str, tool_use_id: &str) {
+    fn link(&mut self, agent_id: &str, tool_use_id: &str, out: &mut Vec<Event>) {
         if self.linked.contains_key(agent_id) {
             return;
         }
         let path = self.subagents_dir.join(format!("agent-{agent_id}.jsonl"));
-        if let Some(acc) = self.accs.get_mut(tool_use_id) {
-            if acc.sub_path.is_none() {
-                acc.sub_path = Some(path);
-                self.linked
-                    .insert(agent_id.to_string(), tool_use_id.to_string());
+        if let Some(sub) = self.subs.get_mut(tool_use_id) {
+            if sub.sub_path.is_none() {
+                sub.sub_path = Some(path);
+                sub.agent_ids.push(agent_id.to_string());
+                self.linked.insert(agent_id.to_string(), tool_use_id.to_string());
+                self.announce(tool_use_id, now_ms(), false, out);
             }
         }
     }
 
     /// Scan the subagents dir: link new transcripts, read finished sidecars,
     /// and tail every linked transcript for new activity.
-    fn scan_subagents(&mut self) {
+    fn scan_subagents(&mut self, out: &mut Vec<Event>) {
         let Ok(entries) = std::fs::read_dir(&self.subagents_dir) else {
             return;
         };
@@ -279,25 +270,38 @@ impl Live {
         for (agent_id, path) in unlinked {
             if let Some(prompt) = first_prompt(&path) {
                 let hit = self
-                    .accs
+                    .subs
                     .iter()
                     .find(|(_, a)| a.sub_path.is_none() && !a.prompt.is_empty() && a.prompt.trim() == prompt.trim())
                     .map(|(id, _)| id.clone());
                 if let Some(tool_use_id) = hit {
-                    self.link(&agent_id, &tool_use_id);
+                    self.link(&agent_id, &tool_use_id, out);
                 }
             }
         }
         for (agent_id, path) in metas {
-            self.load_meta(&agent_id, &path);
+            self.load_meta(&agent_id, &path, out);
         }
-        let ids: Vec<String> = self.accs.keys().cloned().collect();
-        for id in ids {
-            self.tail_subagent(&id);
+        let ids: Vec<String> = self.subs.keys().cloned().collect();
+        for id in &ids {
+            self.tail_subagent(id, out);
+        }
+        // Finished per its sidecar, with no handback or result seen: it ended
+        // at its last activity.
+        for id in &ids {
+            let Some(sub) = self.subs.get_mut(id) else {
+                continue;
+            };
+            if sub.meta_finished && !sub.finished {
+                sub.finished = true;
+                let at = sub.last_ts.or(sub.first_ts).unwrap_or_else(now_ms);
+                let body = Body::AgentFinished { agent: id.clone(), result: None, bytes: None, error: false };
+                out.push(self.ev(at, body));
+            }
         }
     }
 
-    fn load_meta(&mut self, agent_id: &str, meta: &Path) {
+    fn load_meta(&mut self, agent_id: &str, meta: &Path, out: &mut Vec<Event>) {
         let Ok(text) = std::fs::read_to_string(meta) else {
             return;
         };
@@ -309,136 +313,52 @@ impl Live {
         };
         let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         self.ensure(tool_use_id, &s("agentType"), &s("description"));
-        self.link(agent_id, tool_use_id);
+        self.link(agent_id, tool_use_id, out);
+        self.announce(tool_use_id, now_ms(), false, out);
         if v.get("finished").and_then(Value::as_bool) == Some(true) {
-            if let Some(acc) = self.accs.get_mut(tool_use_id) {
-                acc.finished = true;
-                acc.pending.clear();
+            if let Some(sub) = self.subs.get_mut(tool_use_id) {
+                sub.meta_finished = true;
             }
         }
     }
 
-    fn tail_subagent(&mut self, tool_use_id: &str) {
-        let Some(acc) = self.accs.get_mut(tool_use_id) else {
+    fn tail_subagent(&mut self, tool_use_id: &str, out: &mut Vec<Event>) {
+        let session = self.session.clone();
+        let ev = |ts: i64, body: Body| Event::new(Harness::Claude, &session, ts, body);
+        let Some(sub) = self.subs.get_mut(tool_use_id) else {
             return;
         };
-        let Some(path) = acc.sub_path.clone() else {
-            return;
-        };
-        for line in tail(&path, &mut acc.sub_offset) {
-            // Any entry at all is a sign of life (stuck detection), so take
-            // its timestamp before filtering, without a full parse.
-            if let Some(ts) = quick_timestamp(&line) {
-                acc.first_ts.get_or_insert(ts);
-                acc.last_ts = Some(acc.last_ts.map_or(ts, |l| l.max(ts)));
-            }
-            // tool_use blocks, tool_result blocks (which carry "tool_use_id"),
-            // and billed assistant messages
-            if !line.contains("tool_use") && !line.contains("\"usage\"") {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            let ts = v.get("timestamp").and_then(Value::as_str).and_then(iso_to_ms);
-            let rejected =
-                v.pointer("/permissionDecision/decision").and_then(Value::as_str) == Some("reject");
-            let Some(content) = v.pointer("/message/content").and_then(Value::as_array) else {
-                continue;
-            };
-            match v.get("type").and_then(Value::as_str) {
-                Some("assistant") => {
-                    record_usage(&v, ts, &mut acc.model, &mut acc.usage);
-                    let text = content_text(&Value::Array(content.clone()));
-                    if !text.trim().is_empty() {
-                        acc.last_text = text;
-                    }
-                    for block in content {
-                        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
-                            continue;
-                        }
-                        let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-                        let id = block.get("id").and_then(Value::as_str).unwrap_or("");
-                        if !id.is_empty() && !acc.seen.insert(id.to_string()) {
-                            continue; // already counted
-                        }
-                        if name == "SubagentHandback" {
-                            // A handback right after a denial keeps the error.
-                            acc.finished = true;
-                            acc.done_ts = noticed(ts);
-                            acc.pending.clear();
-                            if let Some(msg) = block.pointer("/input/message").and_then(Value::as_str) {
-                                acc.size = human_size(msg.len());
-                                acc.result = Some(msg.to_string());
-                            }
-                            continue;
-                        }
-                        let tts = ts.unwrap_or_else(now_ms);
-                        if let Some((to, len)) = team_message(name, block) {
-                            acc.messages.push((noticed(ts).unwrap_or(tts), to, len));
-                        }
-                        acc.denied = false; // it moved on: not stuck on the denial
-                        acc.tools.push((
-                            tts,
-                            Tool {
-                                name: tool_label(name, block),
-                                kind: tool_kind(name),
-                            },
-                        ));
-                        if !id.is_empty() {
-                            acc.pending.push((id.to_string(), tts, can_prompt(name)));
-                        }
-                        acc.uses.push(Use {
-                            time: tts,
-                            tool: short_tool(name),
-                            file: touched_file(name, block),
-                            edit: is_edit(name),
-                            arg: short_arg(name, block),
-                        });
-                        let cmd = block.pointer("/input/command").and_then(Value::as_str);
-                        if name == "Bash" && !id.is_empty() && cmd.is_some_and(is_test_command) {
-                            acc.test_ids.insert(id.to_string());
-                        }
-                    }
+        let agent = tool_use_id.to_string();
+        let mut batch: Vec<Event> = Vec::new();
+        if let Some(path) = sub.sub_path.clone() {
+            for line in tail(&path, &mut sub.sub_offset) {
+                // Any entry at all is a sign of life (stuck detection), so take
+                // its timestamp before filtering, without a full parse.
+                let qts = quick_timestamp(&line);
+                if let Some(ts) = qts {
+                    sub.first_ts.get_or_insert(ts);
+                    sub.last_ts = Some(sub.last_ts.map_or(ts, |l| l.max(ts)));
                 }
-                Some("user") => {
-                    for block in content {
-                        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-                            continue;
-                        }
-                        if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
-                            acc.pending.retain(|(pid, _, _)| pid != id);
-                            // A Bash call that exits non-zero comes back is_error.
-                            if acc.test_ids.remove(id) && !is_denial(block) {
-                                acc.tests.push(TestRun {
-                                    time: noticed(ts).unwrap_or_else(now_ms),
-                                    passed: block.get("is_error").and_then(Value::as_bool) != Some(true),
-                                });
-                            }
-                        }
-                        if rejected || is_denial(block) {
-                            acc.denied = true;
-                            acc.error_ts = noticed(ts);
-                        }
-                    }
+                let before = batch.len();
+                sub_line(&line, &agent, sub, &mut batch, &ev);
+                // nothing else said it was active: a heartbeat does
+                let quiet = batch[before..].iter().all(|e| matches!(e.body, Body::AgentFinished { .. }));
+                if let (true, Some(ts)) = (quiet, qts) {
+                    batch.push(ev(ts, Body::Heartbeat { agent: agent.clone() }));
                 }
-                _ => {}
             }
         }
+        // A spawn not seen in the main transcript (sidecar only) is announced
+        // before its first activity.
+        if sub.announced.is_none() {
+            let at = sub.first_ts.unwrap_or_else(now_ms);
+            self.announce(tool_use_id, at, true, out);
+        }
+        out.extend(batch);
     }
 
-    fn ensure(&mut self, tool_use_id: &str, atype: &str, desc: &str) -> &mut Acc {
-        let order = self.next_order;
-        let entry = self
-            .accs
-            .entry(tool_use_id.to_string())
-            .or_insert_with(|| Acc {
-                order,
-                ..Acc::default()
-            });
-        if entry.order == order {
-            self.next_order += 1;
-        }
+    fn ensure(&mut self, tool_use_id: &str, atype: &str, desc: &str) -> &mut Sub {
+        let entry = self.subs.entry(tool_use_id.to_string()).or_default();
         // keep the most specific type/description we've seen
         if !atype.is_empty() && (entry.agent_type.is_empty() || entry.agent_type == "general-purpose") {
             entry.agent_type = atype.to_string();
@@ -449,218 +369,153 @@ impl Live {
         entry
     }
 
-    /// Build the render model for the current instant.
-    pub fn build(&self, pricing: &Pricing) -> Session {
-        let mut accs: Vec<(&str, &Acc)> = self.accs.iter().map(|(k, a)| (k.as_str(), a)).collect();
-        accs.sort_by_key(|(_, a)| (a.spawn_ms.or(a.first_ts).unwrap_or(i64::MAX), a.order));
-
-        let now = now_ms();
-        let t0 = self.origin().unwrap_or(now);
-        // spawn tool_use id -> agentIds of its transcript
-        let mut agent_ids: HashMap<&str, Vec<String>> = HashMap::new();
-        for (aid, tid) in &self.linked {
-            agent_ids.entry(tid.as_str()).or_default().push(aid.clone());
+    /// Emit `agent_spawned` if it's new (and `first` allows announcing it)
+    /// or what we know about it changed since we last did.
+    fn announce(&mut self, tool_use_id: &str, at: i64, first: bool, out: &mut Vec<Event>) {
+        let Some(sub) = self.subs.get_mut(tool_use_id) else {
+            return;
+        };
+        if sub.announced.is_none() && !first {
+            return;
         }
-
-        let mut agents = Vec::new();
-        let mut events: Vec<Event> = Vec::new();
-        for &(key, a) in &accs {
-            let role = role_name(&a.agent_type, &a.description);
-            let spawn_ms = a.spawn_ms.or(a.first_ts).unwrap_or(t0);
-            let spawn = spawn_ms - t0;
-            let finish = a
-                .finished
-                .then(|| a.done_ts.or(a.last_ts).unwrap_or(spawn_ms).max(spawn_ms) - t0);
-            let tools: Vec<Tool> = a.tools.iter().map(|(_, t)| t.clone()).collect();
-            let live_tool = tools.len().checked_sub(1);
-            let size = if a.size.is_empty() { "·".to_string() } else { a.size.clone() };
-            let error = a.denied;
-            let error_at = if error { a.error_ts.map(|e| e - t0) } else { None };
-
-            let wait = a
-                .pending
-                .iter()
-                .filter(|(_, _, can)| *can)
-                .map(|(_, ts, _)| *ts)
-                .min()
-                .filter(|pts| !a.finished && !error && now - *pts > WAIT_MS)
-                .map(|pts| (pts - t0 + WAIT_MS, i64::MAX));
-
-            events.push(Event {
-                time: spawn,
-                label: format!("orchestrator \u{2192} {role}"),
-                detail: "dispatch".into(),
-                color: theme::B,
-            });
-            for (ts, tool) in &a.tools {
-                events.push(Event {
-                    time: ts - t0,
-                    label: role.clone(),
-                    detail: tool.name.clone(),
-                    color: theme::G,
-                });
-            }
-            if let Some((ws, _)) = wait {
-                events.push(Event {
-                    time: ws,
-                    label: role.clone(),
-                    detail: "? waiting".into(),
-                    color: theme::AM,
-                });
-            }
-            if let Some(ea) = error_at {
-                events.push(Event {
-                    time: ea,
-                    label: role.clone(),
-                    detail: "error".into(),
-                    color: theme::RED,
-                });
-            }
-            if let Some(f) = finish {
-                events.push(Event {
-                    time: f,
-                    label: format!("{role} \u{2192} orchestrator"),
-                    detail: format!("result {size}"),
-                    color: theme::B,
-                });
-            }
-
-            agents.push(Agent {
-                name: role,
-                model: pricing::family(&a.model),
-                spawn,
-                finish,
-                wait,
-                tools,
-                live_tool,
-                size,
-                bob: (a.order as i64) * 3,
-                error,
-                error_at,
-                calls: priced(&a.usage, t0, pricing),
-                uses: a
-                    .uses
-                    .iter()
-                    .map(|u| Use {
-                        time: u.time - t0,
-                        file: u.file.as_ref().map(|f| match &self.root {
-                            Some(r) => f.strip_prefix(r.as_str()).unwrap_or(f).to_string(),
-                            None => f.clone(),
-                        }),
-                        ..u.clone()
-                    })
-                    .collect(),
-                tests: a.tests.iter().map(|r| TestRun { time: r.time - t0, ..*r }).collect(),
-                task: if a.description.trim().is_empty() {
-                    a.prompt.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string()
-                } else {
-                    a.description.trim().to_string()
-                },
-                result: a.result.clone().or_else(|| {
-                    (a.finished && !a.last_text.trim().is_empty()).then(|| a.last_text.clone())
-                }),
-                last_seen: a.last_ts.map(|l| l - t0),
-                in_flight: if a.finished {
-                    None
-                } else {
-                    a.pending.iter().map(|(_, ts, _)| *ts).min().map(|ts| ts - t0)
-                },
-                prompt: a.prompt.clone(),
-                ids: std::iter::once(key.to_string())
-                    .chain(agent_ids.get(key).cloned().unwrap_or_default())
-                    .collect(),
-            });
+        let role = role_name(&sub.agent_type, &sub.description);
+        let now = (
+            role.clone(),
+            sub.agent_type.clone(),
+            sub.description.clone(),
+            sub.prompt.clone(),
+            sub.alias.clone(),
+            sub.agent_ids.len(),
+        );
+        if sub.announced.as_ref() == Some(&now) {
+            return;
         }
+        sub.announced = Some(now);
+        let body = Body::AgentSpawned {
+            agent: tool_use_id.to_string(),
+            parent: Some(MAIN.to_string()),
+            role,
+            agent_type: sub.agent_type.clone(),
+            task: sub.description.clone(),
+            prompt: sub.prompt.clone(),
+            alias: sub.alias.clone(),
+            ids: sub.agent_ids.clone(),
+        };
+        out.push(self.ev(at, body));
+    }
+}
 
-        // Handoffs: results quoted in a later prompt, plus teammate messages.
-        let mut handoffs = crate::orbit::detect_handoffs(&agents);
-        for (from, (_, a)) in accs.iter().enumerate() {
-            for (ts, to, len) in &a.messages {
-                let target = to.trim().to_lowercase();
-                let hit = accs.iter().enumerate().find(|(j, (_, b))| {
-                    *j != from
-                        && (b.alias.to_lowercase() == target
-                            || agents[*j].name == target
-                            || b.agent_type.to_lowercase() == target)
-                });
-                if let Some((to, _)) = hit {
-                    handoffs.push(crate::model::Handoff {
-                        from,
-                        to,
-                        time: ts - t0,
-                        what: "message".into(),
-                        size: human_size(*len),
-                    });
+/// One subagent transcript line → events for `agent`.
+fn sub_line(line: &str, agent: &str, sub: &mut Sub, out: &mut Vec<Event>, ev: &dyn Fn(i64, Body) -> Event) {
+    // tool_use blocks, tool_result blocks (which carry "tool_use_id"),
+    // and billed assistant messages
+    if !line.contains("tool_use") && !line.contains("\"usage\"") {
+        return;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    let ts = v.get("timestamp").and_then(Value::as_str).and_then(iso_to_ms);
+    let at = ts.unwrap_or_else(now_ms);
+    let rejected = v.pointer("/permissionDecision/decision").and_then(Value::as_str) == Some("reject");
+    let Some(content) = v.pointer("/message/content").and_then(Value::as_array) else {
+        return;
+    };
+    match v.get("type").and_then(Value::as_str) {
+        Some("assistant") => {
+            if let Some(b) = usage_body(&v, agent) {
+                out.push(ev(at, b));
+            }
+            let text = content_text(&Value::Array(content.clone()));
+            if !text.trim().is_empty() {
+                out.push(ev(at, Body::Output { agent: agent.to_string(), text }));
+            }
+            for block in content {
+                if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                    continue;
+                }
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                let id = block.get("id").and_then(Value::as_str).unwrap_or("");
+                if !id.is_empty() && !sub.seen.insert(id.to_string()) {
+                    continue; // already emitted
+                }
+                if name == "SubagentHandback" {
+                    let msg = block.pointer("/input/message").and_then(Value::as_str);
+                    sub.finished = true;
+                    sub.handed_back |= msg.is_some();
+                    out.push(ev(
+                        at,
+                        Body::AgentFinished {
+                            agent: agent.to_string(),
+                            result: msg.map(str::to_string),
+                            bytes: msg.map(|m| m.len() as u64),
+                            error: false,
+                        },
+                    ));
+                    continue;
+                }
+                let cmd = block.pointer("/input/command").and_then(Value::as_str);
+                out.push(ev(
+                    at,
+                    Body::ToolStarted {
+                        agent: agent.to_string(),
+                        call: (!id.is_empty()).then(|| id.to_string()),
+                        tool: short_tool(name),
+                        label: tool_label(name, block),
+                        kind: tool_kind(name),
+                        file: touched_file(name, block),
+                        edit: is_edit(name),
+                        arg: short_arg(name, block),
+                        blocking: can_prompt(name),
+                        test: name == "Bash" && !id.is_empty() && cmd.is_some_and(is_test_command),
+                    },
+                ));
+                if let Some((to, len)) = team_message(name, block) {
+                    out.push(ev(
+                        at,
+                        Body::Handoff { agent: agent.to_string(), to, what: "message".into(), bytes: len as u64 },
+                    ));
                 }
             }
         }
-        handoffs.sort_by_key(|h| h.time);
-        for h in &handoffs {
-            events.push(Event {
-                time: h.time,
-                label: format!("{} \u{2192} {}", agents[h.from].name, agents[h.to].name),
-                detail: format!("{} {}", h.what, h.size),
-                color: theme::B,
-            });
+        Some("user") => {
+            for block in content {
+                if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                    continue;
+                }
+                out.push(ev(
+                    at,
+                    Body::ToolFinished {
+                        agent: agent.to_string(),
+                        call: block.get("tool_use_id").and_then(Value::as_str).map(str::to_string),
+                        // A Bash call that exits non-zero comes back is_error.
+                        error: block.get("is_error").and_then(Value::as_bool) == Some(true),
+                        denied: is_denial(block),
+                    },
+                ));
+            }
+            // The user turned the call down at the permission prompt.
+            if rejected {
+                out.push(ev(at, Body::AgentError { agent: agent.to_string(), message: "rejected".into() }));
+            }
         }
-
-        let all = if !agents.is_empty() && agents.iter().all(|a| a.finish.is_some()) {
-            agents.iter().filter_map(|a| a.finish).max().unwrap_or(0) + 500
-        } else {
-            i64::MAX
-        };
-
-        events.sort_by_key(|e| e.time);
-        let keep = 64usize; // render only shows the last 4
-        if events.len() > keep {
-            events.drain(0..events.len() - keep);
-        }
-
-        Session {
-            header: self.header.clone(),
-            id: self.main_path.file_stem().map(|s| s.to_string_lossy().into_owned()),
-            agents,
-            events,
-            all,
-            length: 0,
-            live: true,
-            orch_model: pricing::family(&self.orch_model),
-            orch_calls: priced(&self.orch_usage, t0, pricing),
-            epoch0: Some(t0),
-            handoffs,
-        }
-    }
-
-    /// Earliest spawn we know about.
-    fn origin(&self) -> Option<i64> {
-        self.accs.values().filter_map(|a| a.spawn_ms.or(a.first_ts)).min()
-    }
-
-    /// The render clock `t` now: ms since the earliest spawn, or since we
-    /// started watching if nothing has spawned yet (keeps the face alive).
-    pub fn clock(&self) -> i64 {
-        now_ms() - self.origin().unwrap_or(self.opened)
+        _ => {}
     }
 }
 
 // ---- helpers ---------------------------------------------------------------
 
-/// Note an assistant entry's model and usage. The same message id appears
-/// once per content block; keep its first-seen time and the largest counts.
-fn record_usage(v: &Value, ts: Option<i64>, model: &mut String, calls: &mut Usage_) {
-    let Some(msg) = v.get("message") else {
-        return;
-    };
+/// An assistant entry's model and token usage, as a `usage` event. The same
+/// message id appears once per content block, each repeating the usage; the
+/// schema's "same id updates the call" rule dedupes them. An entry with a
+/// model but no usage still names the agent's model (zero tokens).
+fn usage_body(v: &Value, agent: &str) -> Option<Body> {
+    let msg = v.get("message")?;
     let m = msg.get("model").and_then(Value::as_str).unwrap_or("");
-    if !m.is_empty() && !m.starts_with('<') {
-        *model = m.to_string();
-    }
-    let Some(u) = msg.get("usage") else {
-        return;
-    };
-    let usage = parse_usage(u);
-    if usage == Usage::default() {
-        return;
+    let model = (!m.is_empty() && !m.starts_with('<')).then(|| m.to_string());
+    let usage = msg.get("usage").map(parse_usage).unwrap_or_default();
+    if model.is_none() && usage == Tokens::default() {
+        return None;
     }
     let id = msg
         .get("id")
@@ -669,14 +524,24 @@ fn record_usage(v: &Value, ts: Option<i64>, model: &mut String, calls: &mut Usag
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let time = noticed(ts).unwrap_or_else(now_ms);
-    let e = calls.entry(id).or_insert((time, Usage::default(), m.to_string()));
-    e.1.max(&usage);
+    Some(Body::Usage {
+        agent: agent.to_string(),
+        id,
+        model,
+        input: usage.0,
+        output: usage.1,
+        cache_read: usage.2,
+        cache_write_5m: usage.3,
+        cache_write_1h: usage.4,
+    })
 }
+
+/// (input, output, cache_read, cache_write_5m, cache_write_1h)
+type Tokens = (u64, u64, u64, u64, u64);
 
 /// An API `usage` object to token counts. Cache writes are split by TTL when
 /// the breakdown is present; otherwise all writes bill at the 5-minute rate.
-fn parse_usage(u: &Value) -> Usage {
+fn parse_usage(u: &Value) -> Tokens {
     let n = |p: &str| u.pointer(p).and_then(Value::as_u64).unwrap_or(0);
     let writes = n("/cache_creation_input_tokens");
     let (w5, w1) = match u.get("cache_creation") {
@@ -686,28 +551,7 @@ fn parse_usage(u: &Value) -> Usage {
         }
         None => (writes, 0),
     };
-    Usage {
-        input: n("/input_tokens"),
-        output: n("/output_tokens"),
-        cache_read: n("/cache_read_input_tokens"),
-        cache_write_5m: w5,
-        cache_write_1h: w1,
-    }
-}
-
-/// Usage map -> priced calls on the session clock, in time order.
-fn priced(calls: &Usage_, t0: i64, pricing: &Pricing) -> Vec<Call> {
-    let mut v: Vec<Call> = calls
-        .values()
-        .map(|(time, usage, model)| Call {
-            time: time - t0,
-            usage: *usage,
-            cost: pricing.cost(model, usage),
-            saved: pricing.cache_savings(model, usage),
-        })
-        .collect();
-    v.sort_by_key(|c| c.time);
-    v
+    (n("/input_tokens"), n("/output_tokens"), n("/cache_read_input_tokens"), w5, w1)
 }
 
 /// A direct message from one teammate to another (agent teams): the
@@ -749,7 +593,6 @@ fn touched_file(name: &str, block: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Stats name for a tool: lowercase; MCP tools keep only their own name.
 /// The text of a message `content` (a string, or an array of blocks whose
 /// `text` fields are joined).
 fn content_text(c: &Value) -> String {
@@ -768,6 +611,12 @@ fn content_text(c: &Value) -> String {
 fn quick_timestamp(line: &str) -> Option<i64> {
     let i = line.find("\"timestamp\":\"")? + 13;
     iso_to_ms(line.get(i..)?)
+}
+
+/// The first timestamp in a transcript's opening lines.
+fn first_timestamp(path: &Path) -> Option<i64> {
+    let f = File::open(path).ok()?;
+    BufReader::new(f).lines().take(80).map_while(Result::ok).find_map(|l| quick_timestamp(&l))
 }
 
 /// A few words saying what a tool call was about, for the detail view.
@@ -795,21 +644,9 @@ fn short_arg(name: &str, block: &Value) -> String {
     s.lines().next().unwrap_or("").to_string()
 }
 
+/// Stats name for a tool: lowercase; MCP tools keep only their own name.
 fn short_tool(name: &str) -> String {
     name.rsplit("__").next().unwrap_or(name).to_lowercase()
-}
-
-/// A shell command that runs a test suite.
-fn is_test_command(cmd: &str) -> bool {
-    let c = cmd.to_lowercase();
-    [
-        "cargo test", "cargo nextest", "pytest", "py.test", "unittest", "npm test",
-        "npm run test", "yarn test", "pnpm test", "bun test", "deno test", "go test",
-        "jest", "vitest", "mocha", "rspec", "phpunit", "mix test", "ctest", "make test",
-        "make check", "gradle test", "mvn test", "dotnet test", "swift test", "tox",
-    ]
-    .iter()
-    .any(|k| c.contains(k))
 }
 
 /// `<dir>/<session-id>/subagents` beside a `<dir>/<session-id>.jsonl` transcript.
@@ -871,76 +708,6 @@ pub fn read_cwd(path: &Path) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Read appended bytes of a file from `*offset` and return the complete lines,
-/// advancing the offset past the last newline. Handles truncation, and never
-/// gets stuck on invalid UTF-8.
-fn tail(path: &Path, offset: &mut u64) -> Vec<String> {
-    let Ok(mut f) = File::open(path) else {
-        return Vec::new();
-    };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    if len < *offset {
-        *offset = 0; // file shrank: re-read from start
-    }
-    if f.seek(SeekFrom::Start(*offset)).is_err() {
-        return Vec::new();
-    }
-    let mut buf = Vec::new();
-    if f.read_to_end(&mut buf).is_err() {
-        return Vec::new();
-    }
-    let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') else {
-        return Vec::new();
-    };
-    *offset += last_nl as u64 + 1;
-    String::from_utf8_lossy(&buf[..last_nl])
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// Live events reach us up to a refresh late. A *recent* event is pinned to
-/// the moment we noticed it so its animation (packet, glitch) plays in full;
-/// older events, e.g. when attaching mid-session, keep their real time.
-fn noticed(ts: Option<i64>) -> Option<i64> {
-    let now = now_ms();
-    ts.map(|t| if (0..2000).contains(&(now - t)) { now } else { t })
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-/// Parse "2026-11-19T06:21:38.273Z" (always UTC) to epoch ms.
-fn iso_to_ms(s: &str) -> Option<i64> {
-    let num = |a: usize, z: usize| -> Option<i64> { s.get(a..z)?.parse::<i64>().ok() };
-    let (year, mon, day) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
-    let (hour, min, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-    let mut ms = 0i64;
-    if s.as_bytes().get(19) == Some(&b'.') {
-        let frac: String = s[20..].chars().take_while(char::is_ascii_digit).take(3).collect();
-        if !frac.is_empty() {
-            ms = format!("{frac:0<3}").parse().unwrap_or(0);
-        }
-    }
-    let days = days_from_civil(year, mon, day);
-    Some((days * 86400 + hour * 3600 + min * 60 + sec) * 1000 + ms)
-}
-
-/// Days since 1970-01-01 (Howard Hinnant's algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
 }
 
 /// Tools that can block on a permission prompt (mutating / external). Pure
@@ -1019,15 +786,6 @@ fn looks_researchy(desc: &str) -> bool {
     ["research", "web", "look up", "latest", "docs"]
         .iter()
         .any(|k| d.contains(k))
-}
-
-/// Byte count to a compact "x.ykb" / "nb" string.
-fn human_size(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes}b")
-    } else {
-        format!("{:.1}kb", bytes as f64 / 1024.0)
-    }
 }
 
 #[cfg(test)]

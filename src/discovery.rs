@@ -106,7 +106,7 @@ fn mtime(p: &Path) -> SystemTime {
 /// main file's mtime alone would make a busy session look idle.
 pub fn activity(transcript: &Path) -> SystemTime {
     let mut newest = mtime(transcript);
-    if let Ok(entries) = fs::read_dir(crate::transcript::subagents_dir(transcript)) {
+    if let Ok(entries) = fs::read_dir(crate::adapters::claude::subagents_dir(transcript)) {
         for e in entries.flatten() {
             newest = newest.max(e.metadata().and_then(|m| m.modified()).unwrap_or(newest));
         }

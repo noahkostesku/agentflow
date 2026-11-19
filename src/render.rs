@@ -812,12 +812,28 @@ fn stats_panel(
     }
     out.push(Line::from(l));
 
-    // files heatmap: top 5
-    let files = stats::top_files(sess, t, 5);
+    // parallelism: how much the agents overlapped
+    let par = stats::parallelism(&sess.agents, t);
+    let mut l = vec![sp(" team   ", D)];
+    if par.work_ms == 0 {
+        l.push(sp("·", D));
+    } else {
+        l.extend(parallel_spans(&par));
+        // "· 49s of work in 36s", when it fits (long sessions run wide)
+        let tail = format!(" · {}", work_in_wall(&par, sess.scale()));
+        let used: usize = l.iter().map(|s| clen(&s.content)).sum();
+        if used + clen(&tail) <= w as usize {
+            l.push(sp(tail, G));
+        }
+    }
+    out.push(Line::from(l));
+
+    // files heatmap: top 4
+    let files = stats::top_files(sess, t, 4);
     let max = files.first().map_or(0, |f| f.1);
     let name_w = 26usize;
     let bar_w = 12usize;
-    for i in 0..5 {
+    for i in 0..4 {
         let label = if i == 0 { " files  " } else { "        " };
         let Some((f, n)) = files.get(i) else {
             out.push(if i == 0 { Line::from(vec![sp(label, D), sp("·", D)]) } else { Line::from("") });
@@ -858,7 +874,14 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'stat
     // that ended a while ago still fills the width.
     let span = t.min(sess.all).max(1);
     let scale = sess.scale();
-    let mut out = vec![rule("timeline", "", w)];
+    let par = stats::parallelism(&sess.agents, t);
+    let mut right = work_in_wall(&par, scale);
+    if par.saved_ms() > 0 {
+        right += &format!(" · saved {}", dur((par.saved_ms() as f64 * scale / 1000.0) as i64));
+    }
+    let mut out = vec![rule("timeline", &right, w)];
+    // the chain of agents that set the session's length: brighter mauve
+    let critical = stats::critical_path(sess, t);
 
     const LABEL: usize = 17;
     let cells = (w as usize).saturating_sub(LABEL + 1).max(8);
@@ -869,8 +892,9 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'stat
         (c0, c1)
     };
 
-    let started: Vec<&Agent> = sess.agents.iter().filter(|a| a.spawn <= t).collect();
-    let shown = &started[started.len().saturating_sub(6)..];
+    let started: Vec<usize> = (0..sess.agents.len()).filter(|&i| sess.agents[i].spawn <= t).collect();
+    let shown: Vec<(usize, &Agent)> =
+        started[started.len().saturating_sub(6)..].iter().map(|&i| (i, &sess.agents[i])).collect();
 
     // Activity per lane: orchestrator = its own calls + every dispatch.
     let orch_times = sess
@@ -882,7 +906,7 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'stat
     let orch = stats::density(orch_times, span, cells);
     let lanes: Vec<Vec<u32>> = shown
         .iter()
-        .map(|a| {
+        .map(|(_, a)| {
             let times = a.uses.iter().map(|u| u.time).chain(a.calls.iter().map(|c| c.time));
             stats::density(times.filter(|x| *x <= t), span, cells)
         })
@@ -905,9 +929,11 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'stat
     }
     out.push(Line::from(l));
 
-    for (a, dens) in shown.iter().zip(&lanes) {
+    for ((i, a), dens) in shown.iter().zip(&lanes) {
         let end = a.finish.unwrap_or(t).min(t);
-        let mut l = vec![sp(" ", D), rarity_span(&a.model, false), sp(pad(&a.name, LABEL - 3), G)];
+        let crit = critical.contains(i);
+        let on = if crit { light() } else { ac() };
+        let mut l = vec![sp(" ", D), rarity_span(&a.model, false), sp(pad(&a.name, LABEL - 3), if crit { B } else { G })];
         let err_cell = a.error_at.filter(|_| a.error).filter(|e| *e <= t).map(cell_of);
         // idle span: from when it went quiet (+ threshold) until now
         let idle_from = stats::stuck_idle(a, t, view.stuck_ms).map(|idle| t - idle + view.stuck_ms);
@@ -921,7 +947,7 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'stat
             } else {
                 let waiting = a.wait.is_some_and(|(ws, we)| ws < c1 && we.min(t) >= c0)
                     || idle_from.is_some_and(|f| f < c1);
-                l.push(sp(level(*n).to_string(), if waiting { D } else { ac() }));
+                l.push(sp(level(*n).to_string(), if waiting { D } else { on }));
             }
         }
         out.push(Line::from(l));
@@ -947,22 +973,42 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'stat
         }
     }
     out = pad_lines(out, 8);
+    // the axis line's label column doubles as the critical-path legend
+    let legend = shown.iter().any(|(i, _)| critical.contains(i)) && critical.len() > 1;
     out.push(Line::from(vec![
-        sp(" ".repeat(LABEL), D),
+        if legend { sp(pad(" ⣿ critical path", LABEL), light()) } else { sp(" ".repeat(LABEL), D) },
         sp(axis.into_iter().collect::<String>(), D),
     ]));
 
-    let peak = stats::peak_parallel(&sess.agents, t);
     let now = sess.agents.iter().filter(|a| a.spawn <= t && a.finish.is_none_or(|f| f > t)).count();
-    let mut p = vec![
-        sp(" parallelism  ", D),
-        sp(format!("peak {peak} agent{}", if peak == 1 { "" } else { "s" }), B),
-    ];
+    let mut p = vec![sp(" parallelism  ", D)];
+    p.extend(parallel_spans(&par));
     if now > 0 && sess.all == i64::MAX {
         p.push(sp(format!("  ·  {now} now"), G));
     }
     out.push(Line::from(p));
     out
+}
+
+/// "38s of work in 13s": summed agent time vs the wall-clock it took (empty
+/// with no agents yet). Durations are as displayed (the demo runs ×3).
+fn work_in_wall(p: &stats::Parallelism, scale: f64) -> String {
+    if p.work_ms <= 0 {
+        return String::new();
+    }
+    let secs = |ms: i64| (ms as f64 * scale / 1000.0) as i64;
+    format!("{} of work in {}", dur(secs(p.work_ms)), dur(secs(p.wall_ms)))
+}
+
+/// "peak 3 agents · avg 1.7× · 2+ active 42%"
+fn parallel_spans(p: &stats::Parallelism) -> Vec<Span<'static>> {
+    vec![
+        sp(format!("peak {} agent{}", p.peak, if p.peak == 1 { "" } else { "s" }), B),
+        sp(" · avg ", D),
+        sp(format!("{:.1}×", p.avg()), B),
+        sp(" · 2+ active ", D),
+        sp(format!("{:.0}%", p.multi_share() * 100.0), B),
+    ]
 }
 
 /// Detail view for the selected agent: header (rarity, role, model, tier,
@@ -1441,11 +1487,23 @@ mod tests {
         }
         assert!(txt.contains("0s") && txt.contains("39s"), "axis: {txt}");
         assert!(txt.contains("parallelism  peak 3 agents"), "{txt}");
-        // the researcher's permission wait is drawn dim, the rest of it in the accent
+        assert!(txt.contains("avg 1.4×") && txt.contains("2+ active 28%"), "{txt}");
+        // 6 agents × ×3 demo time: 49s of work in the 36s from first dispatch to last end
+        assert!(txt.contains("49s of work in 36s · saved 13s"), "{txt}");
+        assert!(txt.contains("⣿ critical path"), "legend: {txt}");
+        // the researcher's permission wait is drawn dim; the critical path
+        // (researcher → reviewer → fixer → test-runner) is brighter mauve
         let lines = frame(&s, 14_000, 14_000, &v, &mut rng);
-        let lane = lines.iter().find(|l| text(std::slice::from_ref(l)).contains("researcher")).unwrap();
-        let colors: Vec<_> = lane.spans.iter().filter(|sp| sp.content.contains(['⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿', '⡀'])).map(|sp| sp.style.fg).collect();
-        assert!(colors.contains(&Some(D)) && colors.contains(&Some(ac())));
+        let cells = |name: &str, nth: usize| -> Vec<Option<Color>> {
+            let lane = lines.iter().filter(|l| text(std::slice::from_ref(l)).contains(name)).nth(nth).unwrap();
+            lane.spans.iter().filter(|sp| sp.content.contains(['⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿', '⡀'])).map(|sp| sp.style.fg).collect()
+        };
+        let researcher = cells("researcher", 0);
+        assert!(researcher.contains(&Some(D)) && researcher.contains(&Some(light())));
+        assert!(!cells("scout", 0).contains(&Some(light())) && cells("scout", 0).contains(&Some(ac())));
+        assert!(cells("reviewer", 0).contains(&Some(light())) && cells("fixer", 0).contains(&Some(light())));
+        assert!(!cells("test-runner", 0).contains(&Some(light())), "the first test-runner ran in parallel");
+        assert!(cells("test-runner", 1).contains(&Some(light())), "the validating one closed the session");
     }
 
     /// The orbit: header switcher with "orbit" in the accent, the ring with
@@ -1542,6 +1600,28 @@ mod tests {
         s.agents[0].wait = None;
         let txt = text(&frame(&s, t, t, &v, &mut rng));
         assert!(txt.contains("(-_-)") && txt.contains("idle 2m"), "{txt}");
+    }
+
+    /// The stats panel's team line: parallelism, plus work vs wall-clock
+    /// when it fits the width.
+    #[test]
+    fn stats_panel_shows_parallelism() {
+        let p = crate::pricing::Pricing::default();
+        let mut s = crate::demo::session("h".into(), &p);
+        let mut rng = rand::thread_rng();
+        let v = View { calm: true, cost: true, panel: Panel::Stats, ..View::default() };
+        let txt = text(&frame(&s, 14_000, 14_000, &v, &mut rng));
+        assert!(txt.contains("team   peak 3 agents · avg 1.4× · 2+ active 28% · 49s of work in 36s"), "{txt}");
+        // a long session at the narrow width: the tail is dropped, not clipped
+        for a in &mut s.agents {
+            a.spawn *= 400;
+            a.finish = a.finish.map(|f| f * 400);
+        }
+        let narrow = View { cost: false, ..v };
+        let t = 14_000 * 400;
+        let lines = frame(&s, t, t, &narrow, &mut rng);
+        let team = lines.iter().map(|l| text(std::slice::from_ref(l))).find(|l| l.contains("team")).unwrap();
+        assert!(team.trim_end().chars().count() as i64 <= width(&narrow) && !team.contains("of work"), "{team}");
     }
 
     #[test]

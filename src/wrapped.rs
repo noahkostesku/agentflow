@@ -1,5 +1,5 @@
 //! `agentflow wrapped`: a year-in-review style recap of your agents, built
-//! from `~/.agentflow/lifetime.json`. Six full-screen slides that animate in,
+//! from `~/.agentflow/lifetime.json`. Seven full-screen slides that animate in,
 //! plus an SVG export of the outro card sized for X (1200×675).
 
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use crate::pricing::fmt_tokens;
 use crate::stats::{classify, Personality};
 use crate::theme::{ac, dim, B, D, G, VD};
 
-pub const SLIDES: usize = 6;
+pub const SLIDES: usize = 7;
 /// Content width of a slide.
 pub const CW: usize = 56;
 
@@ -68,6 +68,17 @@ pub struct Wrapped {
     pub hours: [u64; 24],
     pub top: Option<TopAgent>,
     pub avg_agents: f64,
+    /// summed agent run time and the wall-clock it took (ms), over sessions
+    /// that recorded both
+    pub work_ms: i64,
+    pub wall_ms: i64,
+}
+
+impl Wrapped {
+    /// Agent time that ran side by side: work beyond the wall-clock it took.
+    pub fn time_saved_ms(&self) -> i64 {
+        (self.work_ms - self.wall_ms).max(0)
+    }
 }
 
 /// What kind of orchestrator you are, from average agents per session.
@@ -109,6 +120,8 @@ pub fn aggregate(store: &Store, range: Range, now_ms: i64) -> Wrapped {
         hours: [0; 24],
         top: None,
         avg_agents: 0.0,
+        work_ms: 0,
+        wall_ms: 0,
     };
     /// Everything one role did across the range.
     #[derive(Default)]
@@ -125,6 +138,11 @@ pub fn aggregate(store: &Store, range: Range, now_ms: i64) -> Wrapped {
         w.cost += e.cost;
         w.saved += e.cache_saved;
         w.tokens += e.tokens;
+        // older entries have no wall-clock: leave them out of time saved
+        if e.wall_ms > 0 {
+            w.work_ms += e.work_ms;
+            w.wall_ms += e.wall_ms;
+        }
         for (h, n) in e.hours.iter().enumerate().take(24) {
             w.hours[h] += *n as u64;
         }
@@ -189,6 +207,20 @@ pub fn demo(range: Range) -> Wrapped {
             cost: 17.90,
         }),
         avg_agents: 118.0 / 34.0,
+        work_ms: (11 * 60 + 20) * 60_000,
+        wall_ms: (6 * 60 + 5) * 60_000,
+    }
+}
+
+/// "45s", "12m", "3h05m"
+pub fn hm(ms: i64) -> String {
+    let s = ms.max(0) / 1000;
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s / 60) % 60)
     }
 }
 
@@ -244,7 +276,8 @@ pub fn slide(w: &Wrapped, i: usize, ms: i64) -> Vec<Line<'static>> {
         1 => slide_spend(w, ms),
         2 => slide_top(w, ms),
         3 => slide_hours(w, ms),
-        4 => slide_type(w, ms),
+        4 => slide_time(w, ms),
+        5 => slide_type(w, ms),
         _ => outro_lines(w, ms),
     };
     out.extend(body);
@@ -406,6 +439,43 @@ fn slide_hours(w: &Wrapped, ms: i64) -> Vec<Line<'static>> {
     out
 }
 
+/// Time saved by running agents side by side: summed agent time vs the
+/// wall-clock it took, as two bars.
+fn slide_time(w: &Wrapped, ms: i64) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(sp(center(&typed("running agents side by side saved you", ms, 0)), G)), blank()];
+    if w.wall_ms <= 0 {
+        out.push(blank());
+        out.push(Line::from(sp(center("nothing ran in parallel yet"), D)));
+        return out;
+    }
+    let saved = (w.time_saved_ms() as f64 * ease(ms, 500, 1100)) as i64;
+    let max = w.work_ms.max(w.wall_ms).max(1) as f64;
+    let bar = |v: i64, delay: i64| {
+        let cells = 30.0 * v as f64 / max * ease(ms, delay, 1000);
+        let full = cells.floor() as usize;
+        let part = ["", "⡀", "⣀", "⣄", "⣤", "⣦", "⣶", "⣷"][((cells - full as f64) * 8.0) as usize % 8];
+        format!("{}{part}", "⣿".repeat(full))
+    };
+    let row = |label: &str, v: i64, delay: i64, c: Color| {
+        Line::from(vec![
+            sp(format!("    {label:<7}"), D),
+            sp(format!("{:>8}  ", hm((v as f64 * ease(ms, delay, 1000)) as i64)), B),
+            sp(bar(v, delay), c),
+        ])
+    };
+    out.push(Line::from(sp(center(&hm(saved)), ac())));
+    out.push(Line::from(sp(center("of waiting"), B)));
+    out.push(blank());
+    out.push(row("work", w.work_ms, 900, ac()));
+    out.push(row("wall", w.wall_ms, 1300, dim(ac(), 0.6)));
+    out.push(blank());
+    out.push(Line::from(sp(
+        center(&typed(&format!("{} of agent work in {}", hm(w.work_ms), hm(w.wall_ms)), ms, 2000)),
+        D,
+    )));
+    out
+}
+
 fn slide_type(w: &Wrapped, ms: i64) -> Vec<Line<'static>> {
     let kind = orchestrator_type(w.avg_agents);
     let mut scale = Vec::new();
@@ -450,6 +520,11 @@ pub fn outro_rows(w: &Wrapped) -> Vec<Vec<(String, Color)>> {
         None => top_row.push(("·".into(), B)),
     }
     let hour = peak_hour(w).map_or("·".into(), |h| format!("{h:02}:00"));
+    let time_row: Vec<(String, Color)> = if w.wall_ms > 0 {
+        vec![("time saved   ".into(), D), (hm(w.time_saved_ms()), B), (" running in parallel".into(), D)]
+    } else {
+        vec![("time saved   ".into(), D), ("·".into(), B)]
+    };
     vec![
         vec![("agentflow wrapped".into(), ac()), (format!(" · {}", w.range.label()), D)],
         vec![],
@@ -457,6 +532,7 @@ pub fn outro_rows(w: &Wrapped) -> Vec<Vec<(String, Color)>> {
         vec![(money(w.cost), B), (" spent · ".into(), D), (money(w.saved), B), (" saved by cache".into(), D)],
         top_row,
         vec![("busiest hour ".into(), D), (hour, B)],
+        time_row,
         vec![("you're a     ".into(), D), (orchestrator_type(w.avg_agents).into(), ac())],
     ]
 }
@@ -641,6 +717,36 @@ mod tests {
         assert_eq!(peak_hour(&w), Some(14));
         assert!((w.avg_agents - 3.0).abs() < 1e-9);
         assert_eq!(orchestrator_type(w.avg_agents), "conductor");
+    }
+
+    #[test]
+    fn time_saved_sums_sessions_that_recorded_it() {
+        let mut a = entry(1, vec![], &[]);
+        (a.work_ms, a.wall_ms) = (8 * 60_000, 3 * 60_000); // 8m of work in 3m
+        let mut b = entry(2, vec![], &[]);
+        (b.work_ms, b.wall_ms) = (60_000, 60_000); // one agent: nothing saved
+        let mut old = entry(3, vec![], &[]);
+        old.work_ms = 99 * 60_000; // from before wall-clock was recorded: skipped
+        let w = aggregate(&store(vec![("a", a), ("b", b), ("old", old)]), Range::Month, NOW);
+        assert_eq!((w.work_ms, w.wall_ms, w.time_saved_ms()), (9 * 60_000, 4 * 60_000, 5 * 60_000));
+        let txt = |w: &Wrapped, i: usize| -> String {
+            slide(w, i, 10_000).iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n").collect()
+        };
+        let s = txt(&w, 4);
+        assert!(s.contains("5m") && s.contains("9m of agent work in 4m"), "{s}");
+        assert!(txt(&w, 6).contains("time saved   5m running in parallel"));
+        // nothing recorded: says so instead of "0s"
+        let none = aggregate(&Store::default(), Range::Month, NOW);
+        assert!(txt(&none, 4).contains("nothing ran in parallel yet"));
+        assert!(svg(&none).contains("time saved"));
+    }
+
+    #[test]
+    fn hm_formats() {
+        assert_eq!(hm(45_000), "45s");
+        assert_eq!(hm(12 * 60_000 + 59_000), "12m");
+        assert_eq!(hm((3 * 60 + 5) * 60_000), "3h05m");
+        assert_eq!(hm(-5), "0s");
     }
 
     #[test]

@@ -27,6 +27,10 @@ pub struct Entry {
     pub hours: Vec<u32>,
     /// one record per agent, for the top-agent card
     pub roster: Vec<AgentRec>,
+    /// summed agent run time, ms (0 in entries from before it was recorded)
+    pub work_ms: i64,
+    /// wall-clock from the first dispatch to the last agent's end, ms
+    pub wall_ms: i64,
 }
 
 /// What `wrapped` needs to know about one agent.
@@ -101,7 +105,10 @@ impl Store {
             return false;
         };
         let r = stats::recap(s, t);
+        let par = stats::parallelism(&s.agents, t);
         let entry = Entry {
+            work_ms: par.work_ms,
+            wall_ms: par.wall_ms,
             cost: r.cost,
             tokens: r.tokens,
             agents: s.agents.iter().filter(|a| a.spawn <= t).count(),
@@ -221,6 +228,19 @@ mod tests {
     }
 
     /// Files written before wrapped existed still load; new fields default.
+    #[test]
+    fn records_work_and_wall_clock() {
+        let mut s = session("p", 0.1);
+        let mut b = s.agents[0].clone();
+        b.spawn = 1_000;
+        b.finish = Some(3_000);
+        s.agents.push(b); // 0–4s and 1–3s: 6s of work in 4s
+        let mut st = Store::default();
+        st.record(&s, 10_000);
+        let e = &st.sessions["p"];
+        assert_eq!((e.work_ms, e.wall_ms), (6_000, 4_000));
+    }
+
     #[test]
     fn old_entries_load_with_defaults() {
         let st: Store = serde_json::from_str(

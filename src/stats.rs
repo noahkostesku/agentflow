@@ -451,6 +451,106 @@ pub fn peak_parallel(agents: &[Agent], t: i64) -> usize {
         .unwrap_or(0)
 }
 
+/// How parallel the agents ran, by `t`. Each agent runs from its dispatch to
+/// its finish (or `t`); the window is the first dispatch to the last end.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Parallelism {
+    /// most agents running at once
+    pub peak: usize,
+    /// summed agent run time (ms)
+    pub work_ms: i64,
+    /// wall-clock from the first dispatch to the last agent's end (ms)
+    pub wall_ms: i64,
+    /// time with 2+ agents running (ms)
+    pub multi_ms: i64,
+}
+
+impl Parallelism {
+    /// Average agents running over the window (time-weighted): work ÷ wall.
+    pub fn avg(&self) -> f64 {
+        if self.wall_ms <= 0 {
+            0.0
+        } else {
+            self.work_ms as f64 / self.wall_ms as f64
+        }
+    }
+    /// Share of the window (0..1) with 2+ agents running.
+    pub fn multi_share(&self) -> f64 {
+        if self.wall_ms <= 0 {
+            0.0
+        } else {
+            self.multi_ms as f64 / self.wall_ms as f64
+        }
+    }
+    /// Agent time that overlapped: work done beyond the wall-clock it took.
+    pub fn saved_ms(&self) -> i64 {
+        (self.work_ms - self.wall_ms).max(0)
+    }
+}
+
+pub fn parallelism(agents: &[Agent], t: i64) -> Parallelism {
+    let spans: Vec<(i64, i64)> = agents
+        .iter()
+        .filter(|a| a.spawn <= t)
+        .map(|a| (a.spawn, a.finish.unwrap_or(t).min(t).max(a.spawn)))
+        .collect();
+    let (Some(start), Some(end)) = (spans.iter().map(|s| s.0).min(), spans.iter().map(|s| s.1).max()) else {
+        return Parallelism::default();
+    };
+    // Sweep the starts and ends; at the same instant ends go first, so one
+    // agent handing straight to the next doesn't count as overlap.
+    let mut ev: Vec<(i64, i32)> =
+        spans.iter().filter(|(s, e)| e > s).flat_map(|&(s, e)| [(s, 1), (e, -1)]).collect();
+    ev.sort_unstable();
+    let (mut n, mut prev, mut multi) = (0i32, start, 0i64);
+    for (x, d) in ev {
+        if n >= 2 {
+            multi += x - prev;
+        }
+        prev = x;
+        n += d;
+    }
+    Parallelism {
+        peak: peak_parallel(agents, t),
+        work_ms: spans.iter().map(|(s, e)| e - s).sum(),
+        wall_ms: end - start,
+        multi_ms: multi,
+    }
+}
+
+/// The chain of agents that set how long the session took, in time order.
+/// Start from the agent that ended last (among ties, the one running
+/// longest, then the first dispatched), then step back to the agent it waited on: the last one to finish
+/// before it was dispatched (a handoff to it breaks ties). Stop when nothing
+/// had finished before it.
+pub fn critical_path(sess: &Session, t: i64) -> Vec<usize> {
+    let a = &sess.agents;
+    let end = |i: usize| a[i].finish.unwrap_or(t).min(t);
+    let started: Vec<usize> = (0..a.len()).filter(|&i| a[i].spawn <= t).collect();
+    let Some(mut cur) = started.iter().copied().max_by_key(|&i| (end(i), std::cmp::Reverse((a[i].spawn, i)))) else {
+        return Vec::new();
+    };
+    let mut path = vec![cur];
+    loop {
+        let spawn = a[cur].spawn;
+        let fed = |i: usize| sess.handoffs.iter().any(|h| h.from == i && h.to == cur);
+        let prev = started
+            .iter()
+            .copied()
+            .filter(|&i| a[i].finish.is_some_and(|f| f <= spawn && f <= t))
+            .max_by_key(|&i| (a[i].finish, fed(i), a[i].spawn));
+        match prev {
+            Some(p) if !path.contains(&p) => {
+                path.push(p);
+                cur = p;
+            }
+            _ => break,
+        }
+    }
+    path.reverse();
+    path
+}
+
 /// Event counts per cell over [0, span): drives swimlane braille density.
 pub fn density(times: impl Iterator<Item = i64>, span: i64, cells: usize) -> Vec<u32> {
     let mut out = vec![0u32; cells];
@@ -562,6 +662,75 @@ mod tests {
         assert_eq!(peak_parallel(&agents, 150), 2);
         assert_eq!(peak_parallel(&[], 10), 0);
         assert_eq!(density([0, 1, 5, 9, 10, -1].into_iter(), 10, 2), vec![2, 2]);
+    }
+
+    #[test]
+    fn parallelism_math() {
+        // a 0–4s, b 1–3s overlap for 2s; c runs alone 5–6s after a 1s gap
+        let agents = vec![agent("a", 0, Some(4_000)), agent("b", 1_000, Some(3_000)), agent("c", 5_000, Some(6_000))];
+        let p = parallelism(&agents, 10_000);
+        assert_eq!((p.peak, p.work_ms, p.wall_ms, p.multi_ms), (2, 7_000, 6_000, 2_000));
+        assert!((p.avg() - 7.0 / 6.0).abs() < 1e-9, "time-weighted average = work / wall");
+        assert!((p.multi_share() - 1.0 / 3.0).abs() < 1e-9);
+        assert_eq!(p.saved_ms(), 1_000, "7s of work in 6s");
+
+        // at t=2s: only what has happened so far (a 0–2, b 1–2)
+        let p = parallelism(&agents, 2_000);
+        assert_eq!((p.work_ms, p.wall_ms, p.multi_ms), (3_000, 2_000, 1_000));
+
+        // three fully parallel: 9s of work in 3s
+        let par = vec![agent("a", 0, Some(3_000)), agent("b", 0, Some(3_000)), agent("c", 0, Some(3_000))];
+        let p = parallelism(&par, 10_000);
+        assert_eq!((p.peak, p.work_ms, p.wall_ms, p.multi_ms, p.saved_ms()), (3, 9_000, 3_000, 3_000, 6_000));
+        assert!((p.avg() - 3.0).abs() < 1e-9 && (p.multi_share() - 1.0).abs() < 1e-9);
+
+        // back to back (a handoff): no overlap, nothing saved
+        let seq = vec![agent("a", 0, Some(1_000)), agent("b", 1_000, Some(2_000))];
+        let p = parallelism(&seq, 5_000);
+        assert_eq!((p.multi_ms, p.saved_ms(), p.wall_ms), (0, 0, 2_000));
+        assert!((p.avg() - 1.0).abs() < 1e-9);
+
+        // still running: clipped at t; nothing at all: zeros, no division by zero
+        let p = parallelism(&[agent("a", 1_000, None)], 1_500);
+        assert_eq!((p.work_ms, p.wall_ms, p.peak), (500, 500, 1));
+        let z = parallelism(&[], 1_000);
+        assert_eq!(z, Parallelism::default());
+        assert_eq!((z.avg(), z.multi_share(), z.saved_ms()), (0.0, 0.0, 0));
+    }
+
+    #[test]
+    fn critical_path_follows_what_gated_each_dispatch() {
+        use crate::model::Handoff;
+        let h = |from, to| Handoff { from, to, time: 0, what: String::new(), size: String::new() };
+        // r 0–2s → f 2.5–6s → v 6.5–8s, beside x 0–5s (parallel, not gating)
+        let mut s = live(vec![
+            agent("r", 0, Some(2_000)),
+            agent("x", 0, Some(5_000)),
+            agent("f", 2_500, Some(6_000)),
+            agent("v", 6_500, Some(8_000)),
+        ]);
+        assert_eq!(critical_path(&s, 9_000), vec![0, 2, 3]);
+        // mid-run: x and f both run until "now"; x has run longest (since 0),
+        // so x alone accounts for the elapsed time
+        assert_eq!(critical_path(&s, 4_000), vec![1]);
+        // once x is done, f (still running) ends last, gated by r
+        assert_eq!(critical_path(&s, 5_500), vec![0, 2]);
+        // and before anything finished: just the longest-running agent
+        assert_eq!(critical_path(&s, 1_000), vec![0]);
+
+        // the orchestrator also waited on y (done at 6.2s) before v: y gated it,
+        // even though f handed v its task
+        s.agents.push(agent("y", 3_000, Some(6_200)));
+        s.handoffs = vec![h(2, 3)];
+        assert_eq!(critical_path(&s, 9_000), vec![0, 4, 3]);
+        // a tie on finish time goes to the handoff source
+        s.agents[4].finish = Some(6_000);
+        assert_eq!(critical_path(&s, 9_000), vec![0, 2, 3]);
+        s.handoffs.clear();
+        // no handoff: the tie goes to the later dispatch (y)
+        assert_eq!(critical_path(&s, 9_000), vec![0, 4, 3]);
+
+        assert!(critical_path(&live(vec![]), 1_000).is_empty());
     }
 
     fn agent(name: &str, spawn: i64, finish: Option<i64>) -> Agent {

@@ -98,7 +98,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Your agents, wrapped: six animated slides from your lifetime history
+    /// Your agents, wrapped: seven animated slides from your lifetime history
     /// (space / → next, ← back, q quit).
     Wrapped {
         /// Only the last 7 days.
@@ -113,7 +113,7 @@ enum Cmd {
         /// Write the outro card as an SVG (1200×675, sized for X) and exit.
         #[arg(long, value_name = "FILE")]
         export: Option<PathBuf>,
-        /// Debug: print slide N (1–6) at --at ms, then exit.
+        /// Debug: print slide N (1–7) at --at ms, then exit.
         #[arg(long, value_name = "N", hide = true)]
         slide: Option<usize>,
         /// Debug: animation time for --slide.

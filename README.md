@@ -29,7 +29,7 @@ echo 'alias aflow="agentflow"' >> ~/.zshrc && source ~/.zshrc
 ```sh
 agentflow            # live: watch the session for the current directory
 agentflow --demo     # looping scripted demo (no session needed)
-agentflow wrapped    # your month with agents, as six animated slides
+agentflow wrapped    # your month with agents, as seven animated slides
 ```
 
 | flag | meaning |
@@ -122,13 +122,30 @@ fallback so a new point release still gets a sane price. Unknown models cost $0
 rather than a guess. You can override rates in the config without rebuilding.
 
 **`s` stats** — per agent: a tokens/sec sparkline over its lifetime, average
-tok/s, cache-hit %, and cost; the session's cache-hit %; the most-used tools; and
-the five most-touched files as braille heat bars.
+tok/s, cache-hit %, and cost; the session's cache-hit %; the most-used tools; how
+parallel the agents ran (`team` line, see below); and the four most-touched files
+as braille heat bars.
 
 **`t` timeline** — swimlanes: one lane per agent, orchestrator first, across the
 whole session. Each cell is braille as dense as the activity (tool calls and model
 calls) in that slice of time: mauve while active, dim while waiting or idle, a red
-`┃` where an error landed. Below: a time axis and `parallelism: peak N agents`.
+`┃` where an error landed. The **critical path** (the chain of agents that set how
+long the session took) is drawn in brighter mauve. Below: a time axis and the
+parallelism line.
+
+**Parallelism** (timeline and stats), measured over each agent's run from dispatch
+to finish, across the window from the first dispatch to the last agent's end:
+
+- **peak**: most agents running at once
+- **avg 1.7×**: average agents running over that window (total agent time ÷ wall-clock)
+- **2+ active 42%**: share of the window with two or more agents running
+- **time saved**: total agent time vs wall-clock, e.g. `8m of work in 3m · saved 5m`
+  (in the timeline's header; the stats line drops it when the terminal is too narrow)
+
+The critical path starts at the agent that ended last and steps back to the agent
+it waited on: the last one to finish before it was dispatched (a handoff to it
+breaks ties). Agents that ran alongside it, off that chain, didn't change how long
+the session took.
 
 **`l` lifetime** — totals across every session you've watched: sessions, agents,
 spend, tokens, cache savings, fastest agent, achievements collected. Needs
@@ -183,7 +200,7 @@ agentflow wrapped --all                 # everything on record
 agentflow wrapped --export wrapped.svg  # the outro card as an SVG, then exit
 ```
 
-Six full-screen slides, each animating in (numbers count up, bars fill, text
+Seven full-screen slides, each animating in (numbers count up, bars fill, text
 types out). `space` / `→` next, `←` back, `q` quit:
 
 1. **your agents, this month** — agents and sessions
@@ -191,9 +208,12 @@ types out). `space` / `→` next, `←` back, `q` quit:
 3. **your top agent** — a character card for the role with the most output
    tokens: face, rarity (its most-used model), personality, runs
 4. **your busiest hours** — a braille bar chart of tool calls by hour of day
-5. **orchestrator type** — from average agents per session: soloist (≤1),
+5. **time saved** — total agent time vs the wall-clock it took, as two bars
+   ("11h20m of agent work in 6h05m"), and the difference: time saved by running
+   agents in parallel
+6. **orchestrator type** — from average agents per session: soloist (≤1),
    duo (~2), conductor (3–4), swarm lord (5+)
-6. **outro** — a summary card
+7. **outro** — a summary card
 
 `--export` writes the outro as a 1200×675 SVG (X's card size): `#0a0a0a`
 background, your accent color, monospace type. With no history in the chosen
@@ -201,7 +221,8 @@ range yet, wrapped shows demo data and says so.
 
 It reads `~/.agentflow/lifetime.json`, which agentflow fills while you watch
 sessions (with `persistence` on). Sessions recorded before this version have no
-start time or per-agent detail, so they only count toward `--all` totals.
+start time or per-agent detail, so they only count toward `--all` totals; sessions
+recorded before time saved existed are left out of it.
 
 ## How it works
 

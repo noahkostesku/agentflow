@@ -40,5 +40,8 @@ script.
 Pricing is downstream too: `usage` events carry token counts and a model id,
 and `pricing.rs` turns them into dollars.
 
-Discovery, finding which session to watch, is still Claude-only
-(`discovery.rs`). It becomes per-adapter when other harnesses land.
+Discovery, finding which session to watch, is per adapter too: each knows
+where its harness stores sessions (`adapters::<harness>::find`), and
+`discovery.rs` picks among them: `--session` in whichever harness has it, else
+the project's most recently active session in any supported harness, else the
+newest anywhere. `--source` narrows the search to one harness.

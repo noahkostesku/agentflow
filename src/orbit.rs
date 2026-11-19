@@ -1,5 +1,5 @@
 //! Orbit view (`v`): the orchestrator at the center, subagents evenly spaced
-//! on an elliptical ring around it. Port of docs/agentflow-orbit-mockup.html.
+//! on an elliptical ring around it. Ported from the original HTML orbit mockup.
 //!
 //! Why each element exists (from the mockup):
 //!   * spokes + packets: dispatch and return between the orchestrator and each

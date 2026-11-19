@@ -1,5 +1,5 @@
 //! The scripted demo session: the agentflow mockup's tree flow plus the orbit
-//! mockup's (docs/agentflow-orbit-mockup.html) handoff chain. Replays on a loop.
+//! mockup's handoff chain. Replays on a loop.
 //!
 //! scout, researcher and a test-runner start in parallel (team player): the
 //! test-runner (a validator) finds a failing parser test. Then the reviewer

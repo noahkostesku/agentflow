@@ -20,11 +20,15 @@
 //!     `cache_write_input_tokens` and `output_tokens` (reasoning included).
 //!   * `event_msg/task_complete` ends a turn with `last_agent_message`.
 //!
-//! Codex runs one agent per session here (`subagents: false`): everything is
-//! the agent `main`. Its `collaboration.spawn_agent` tool exists, but no
-//! session with subagents has been observed, so spawns show as tool calls.
+//! Subagents (`collaboration.spawn_agent`) each get their own rollout in the
+//! same folder. Its `session_meta` names `parent_thread_id`, `agent_path`
+//! ("/root/repo_overview") and `agent_nickname` ("Socrates"), and its first
+//! `subagent_history_start_ordinal` records are a copy of the parent's
+//! history (skipped: not its work, and it would count the cost twice). A
+//! subagent is the agent with its thread id, named by its nickname with its
+//! path as the tag; `send_message` to another agent is a handoff.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -46,17 +50,45 @@ enum Op {
     Other,
 }
 
-pub struct CodexAdapter {
+/// One rollout file: the session's main thread, or one subagent's.
+struct Thread {
+    /// the main session's id (every event's envelope)
     session: String,
+    /// the agent its events are about: [`MAIN`], or the subagent's thread id
+    agent: String,
     path: PathBuf,
     offset: u64,
-    started: bool,
+    /// records below this ordinal are the parent's history, copied into a
+    /// subagent's file when it forks: not this agent's work
+    skip_below: i64,
     /// latest model id
     model: Option<String>,
     /// call ids already seen
     seen: HashSet<String>,
     /// started, not yet finished: (event call id, the exec call id, op)
     open: Vec<(String, String, Op)>,
+}
+
+/// A subagent's rollout, from its `session_meta`.
+#[derive(Clone, Debug, PartialEq)]
+struct Child {
+    id: String,
+    parent: String,
+    nickname: String,
+    /// "/root/repo_overview"
+    agent_path: String,
+    start_ordinal: i64,
+    ts: i64,
+}
+
+pub struct CodexAdapter {
+    session: String,
+    path: PathBuf,
+    started: bool,
+    /// main thread first, then subagents as they're found
+    threads: Vec<Thread>,
+    /// rollout files already looked at: their subagent header, if any
+    seen_files: HashMap<PathBuf, Option<Child>>,
 }
 
 impl SourceAdapter for CodexAdapter {
@@ -79,8 +111,149 @@ impl SourceAdapter for CodexAdapter {
             let meta = head(&self.path);
             let cwd = meta.as_ref().and_then(|m| m.pointer("/payload/cwd")).and_then(Value::as_str);
             let ts = meta.as_ref().and_then(record_ts).unwrap_or_else(now_ms);
-            out.push(self.ev(ts, Body::SessionStarted { cwd: cwd.map(str::to_string), subagents: false }));
+            let body = Body::SessionStarted { cwd: cwd.map(str::to_string), subagents: true };
+            out.push(Event::new(Harness::Codex, &self.session, ts, body));
         }
+        self.find_children(&mut out);
+        for th in &mut self.threads {
+            out.extend(th.poll());
+        }
+        // threads are read one after another: put them back in time order
+        // (stable, so a spawn stays ahead of its agent's first record)
+        out.sort_by_key(|e| e.ts);
+        out
+    }
+}
+
+impl CodexAdapter {
+    pub fn open(path: &Path) -> Self {
+        let session = session_id_of(path);
+        CodexAdapter {
+            threads: vec![Thread::open(path, &session, MAIN, 0)],
+            session,
+            path: path.to_path_buf(),
+            started: false,
+            seen_files: HashMap::new(),
+        }
+    }
+
+    /// Subagents write their own rollouts beside the parent's (or in a later
+    /// day's folder): spawn each one whose parent is in this session's tree.
+    fn find_children(&mut self, out: &mut Vec<Event>) {
+        let mut dirs: Vec<PathBuf> = self.path.parent().map(Path::to_path_buf).into_iter().collect();
+        if let Some(root) = self.path.ancestors().nth(4) {
+            let today = chrono::Local::now().format("%Y/%m/%d").to_string();
+            let d = root.join(today);
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+        let mut found = Vec::new();
+        for d in dirs {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                let rollout = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"));
+                if !rollout || p == self.path || self.seen_files.contains_key(&p) {
+                    continue;
+                }
+                // a file still being created has no header yet: look again later
+                let Some(meta) = head(&p) else {
+                    continue;
+                };
+                let child = child_of(&meta);
+                self.seen_files.insert(p.clone(), child.clone());
+                if let Some(c) = child {
+                    found.push((p, c));
+                }
+            }
+        }
+        // parents before children (a grandchild's parent must be known first)
+        found.sort_by_key(|(_, c)| c.ts);
+        let mut pending = found;
+        loop {
+            let before = pending.len();
+            pending.retain(|(p, c)| {
+                let parent = if c.parent == self.session {
+                    Some(MAIN.to_string())
+                } else {
+                    self.threads.iter().find(|t| t.agent == c.parent).map(|t| t.agent.clone())
+                };
+                let Some(parent) = parent else {
+                    return true; // not ours (yet)
+                };
+                let role = c.agent_path.rsplit('/').next().unwrap_or("").to_string();
+                let body = Body::AgentSpawned {
+                    agent: c.id.clone(),
+                    parent: Some(parent),
+                    role: if c.nickname.is_empty() { role.clone() } else { c.nickname.to_lowercase() },
+                    tag: if c.nickname.is_empty() { String::new() } else { role.clone() },
+                    agent_type: String::new(),
+                    task: role,
+                    prompt: String::new(),
+                    alias: c.agent_path.clone(),
+                    ids: Vec::new(),
+                };
+                out.push(Event::new(Harness::Codex, &self.session, c.ts, body));
+                self.threads.push(Thread::open(p, &self.session, &c.id, c.start_ordinal));
+                false
+            });
+            if pending.is_empty() || pending.len() == before {
+                break;
+            }
+        }
+        // files whose parent isn't in this tree stay unclaimed; forget them
+        // so a parent found later can still claim its children
+        for (p, _) in pending {
+            self.seen_files.remove(&p);
+        }
+    }
+}
+
+/// A rollout's subagent header (`source.subagent.thread_spawn`), if it is one.
+fn child_of(meta: &Value) -> Option<Child> {
+    let p = meta.get("payload")?;
+    let spawn = p.pointer("/source/subagent/thread_spawn");
+    let parent = p
+        .get("parent_thread_id")
+        .and_then(Value::as_str)
+        .or_else(|| spawn.and_then(|s| s.get("parent_thread_id")).and_then(Value::as_str))?;
+    let s = |k: &str| {
+        p.get(k)
+            .and_then(Value::as_str)
+            .or_else(|| spawn.and_then(|s| s.get(k)).and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string()
+    };
+    Some(Child {
+        id: p.get("id").and_then(Value::as_str)?.to_string(),
+        parent: parent.to_string(),
+        nickname: s("agent_nickname"),
+        agent_path: s("agent_path"),
+        start_ordinal: p.get("subagent_history_start_ordinal").and_then(Value::as_i64).unwrap_or(0),
+        ts: record_ts(meta).unwrap_or_else(now_ms),
+    })
+}
+
+impl Thread {
+    fn open(path: &Path, session: &str, agent: &str, skip_below: i64) -> Self {
+        Thread {
+            session: session.to_string(),
+            agent: agent.to_string(),
+            path: path.to_path_buf(),
+            offset: 0,
+            skip_below,
+            model: None,
+            seen: HashSet::new(),
+            open: Vec::new(),
+        }
+    }
+
+    /// New records → events about this thread's agent.
+    fn poll(&mut self) -> Vec<Event> {
+        let mut out = Vec::new();
         for line in tail(&self.path, &mut self.offset) {
             let Ok(r) = serde_json::from_str::<Value>(&line) else {
                 continue;
@@ -88,6 +261,10 @@ impl SourceAdapter for CodexAdapter {
             let Some(ts) = record_ts(&r) else {
                 continue;
             };
+            // the parent's copied history: skip it (else its cost counts twice)
+            if r.get("ordinal").and_then(Value::as_i64).is_some_and(|o| o < self.skip_below) {
+                continue;
+            }
             let before = out.len();
             self.record(&r, ts, &mut out);
             // nothing else said it was alive: a heartbeat does
@@ -95,21 +272,12 @@ impl SourceAdapter for CodexAdapter {
                 out.push(self.ev(ts, Body::Heartbeat { agent: MAIN.into() }));
             }
         }
-        out
-    }
-}
-
-impl CodexAdapter {
-    pub fn open(path: &Path) -> Self {
-        CodexAdapter {
-            session: session_id_of(path),
-            path: path.to_path_buf(),
-            offset: 0,
-            started: false,
-            model: None,
-            seen: HashSet::new(),
-            open: Vec::new(),
+        if self.agent != MAIN {
+            for e in &mut out {
+                e.set_agent(&self.agent);
+            }
         }
+        out
     }
 
     fn ev(&self, ts: i64, body: Body) -> Event {
@@ -222,6 +390,19 @@ impl CodexAdapter {
         } else {
             vec![(tool_body(name, name, ToolKind::Run, ""), Op::Other)]
         };
+        // a message to another agent ("/root", "/root/repo_overview")
+        if name == "send_message" {
+            let args: Value = p
+                .get("arguments")
+                .and_then(Value::as_str)
+                .and_then(|a| serde_json::from_str(a).ok())
+                .unwrap_or(Value::Null);
+            if let Some(to) = args.get("target").and_then(Value::as_str) {
+                let bytes = args.get("message").and_then(Value::as_str).map_or(0, str::len) as u64;
+                let body = Body::Handoff { agent: MAIN.into(), to: to.to_string(), what: "message".into(), bytes };
+                out.push(self.ev(ts, body));
+            }
+        }
         for (i, (mut body, op)) in ops.into_iter().enumerate() {
             let id = if i == 0 { call.to_string() } else { format!("{call}#{i}") };
             if let Body::ToolStarted { call: c, .. } = &mut body {
@@ -249,6 +430,7 @@ impl CodexAdapter {
                         agent: MAIN.into(),
                         parent: None,
                         role: String::new(),
+                        tag: String::new(),
                         agent_type: String::new(),
                         task: String::new(),
                         prompt: text,
@@ -528,24 +710,81 @@ fn rollouts(root: &Path) -> Vec<(PathBuf, SystemTime)> {
     out
 }
 
-/// The session to watch: `id` anywhere; else the most recently active one
-/// that ran in `project`; else (when `fallback`) the most recent anywhere.
+/// The session to watch: `id` anywhere; else the most recently active
+/// top-level session that ran in `project`; else (when `fallback`) the most
+/// recently active one anywhere. A session's activity includes its
+/// subagents' files (a parent sits quiet while they work), and subagent
+/// rollouts are never picked on their own.
 pub fn find(root: &Path, id: Option<&str>, project: Option<&Path>, fallback: bool) -> Option<PathBuf> {
     let mut all = rollouts(root);
     all.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
     if let Some(id) = id {
         return all.into_iter().map(|(p, _)| p).find(|p| session_id_of(p) == id);
     }
-    if let Some(dir) = project {
-        let want = dir.to_string_lossy();
-        let hit = all.iter().find(|(p, _)| {
-            head(p).and_then(|m| m.pointer("/payload/cwd").and_then(Value::as_str).map(|c| c.trim_end_matches('/') == want.trim_end_matches('/'))) == Some(true)
-        });
-        if let Some((p, _)) = hit {
-            return Some(p.clone());
+    if project.is_none() && !fallback {
+        return None;
+    }
+    let want = project.map(|d| d.to_string_lossy().trim_end_matches('/').to_string());
+    // top-level session id -> (activity, its rollout once seen)
+    let mut tops: HashMap<String, (SystemTime, Option<PathBuf>)> = HashMap::new();
+    let mut parent_of: HashMap<String, String> = HashMap::new();
+    // newest first: stop once the most active session is known and nothing
+    // older can beat it
+    for (p, m) in all {
+        let lead = tops.values().max_by_key(|(a, _)| *a);
+        if lead.is_some_and(|(a, path)| path.is_some() && *a > m) {
+            break;
+        }
+        let Some(meta) = head(&p) else {
+            continue;
+        };
+        let cwd = meta.pointer("/payload/cwd").and_then(Value::as_str).map(|c| c.trim_end_matches('/'));
+        if want.as_deref().is_some_and(|w| cwd != Some(w)) {
+            continue;
+        }
+        let (top, path) = match child_of(&meta) {
+            Some(c) => {
+                parent_of.insert(c.id, c.parent.clone());
+                let mut top = c.parent;
+                while let Some(up) = parent_of.get(&top) {
+                    top = up.clone();
+                }
+                (top, None)
+            }
+            None => (session_id_of(&p), Some(p)),
+        };
+        let e = tops.entry(top).or_insert((m, None));
+        e.0 = e.0.max(m);
+        if path.is_some() {
+            e.1 = path;
         }
     }
-    fallback.then(|| all.into_iter().next().map(|(p, _)| p)).flatten()
+    let best = tops.into_values().filter_map(|(a, p)| p.map(|p| (a, p))).max_by_key(|(a, _)| *a).map(|(_, p)| p);
+    match best {
+        // nothing ran in the project: the most recent session anywhere
+        None if fallback && project.is_some() => find(root, None, None, true),
+        found => found,
+    }
+}
+
+/// When a session last showed signs of life: its rollout or any of its
+/// subagents' (at any depth).
+pub fn activity(root: &Path, path: &Path) -> SystemTime {
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+    let own = mtime(path);
+    let mut ids: HashSet<String> = HashSet::from([session_id_of(path)]);
+    let mut newer: Vec<(PathBuf, SystemTime)> = rollouts(root).into_iter().filter(|(_, m)| *m > own).collect();
+    newer.sort_by_key(|(_, m)| *m);
+    let mut best = own;
+    for (p, m) in newer {
+        if let Some(c) = head(&p).as_ref().and_then(child_of) {
+            if ids.contains(&c.parent) {
+                ids.insert(c.id);
+                best = best.max(m);
+            }
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -575,7 +814,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(evs[0].session, "0000aaaa-1111-2222-3333-444455556666");
-        assert!(matches!(&evs[0].body, Body::SessionStarted { cwd: Some(c), subagents: false } if c == "/w/proj"));
+        assert!(matches!(&evs[0].body, Body::SessionStarted { cwd: Some(c), subagents: true } if c == "/w/proj"));
         let tools: Vec<(String, String, bool, Option<String>)> = evs
             .iter()
             .filter_map(|e| match &e.body {
@@ -653,6 +892,99 @@ mod tests {
         assert_eq!(js_string_field(r#"tools.exec_command({cmd:"echo \"hi\" && ls","workdir":"/w"})"#, "cmd").as_deref(), Some(r#"echo "hi" && ls"#));
         assert_eq!(js_string_field(r#"{"cmd": "ls"}"#, "cmd").as_deref(), Some("ls"));
         assert_eq!(session_id_of(Path::new("rollout-2026-11-19T11-06-39-01a1f48f-60ec-7ca2-9b80-b01e148932ec.jsonl")), "01a1f48f-60ec-7ca2-9b80-b01e148932ec");
+    }
+
+    const PARENT: &str = include_str!("../../tests/fixtures/codex/subagents/rollout-2026-01-02T00-00-00-1111aaaa-0000-4000-8000-000000000001.jsonl");
+    const CHILD: &str = include_str!("../../tests/fixtures/codex/subagents/rollout-2026-01-02T00-00-01-1111aaaa-0000-4000-8000-000000000002.jsonl");
+    const CHILD_ID: &str = "1111aaaa-0000-4000-8000-000000000002";
+
+    /// A parent rollout and one subagent's, in a day folder under `root`.
+    fn write_team(root: &Path) -> (PathBuf, PathBuf) {
+        let day = root.join("2026").join("01").join("02");
+        std::fs::create_dir_all(&day).unwrap();
+        let parent = day.join("rollout-2026-01-02T00-00-00-1111aaaa-0000-4000-8000-000000000001.jsonl");
+        let child = day.join(format!("rollout-2026-01-02T00-00-01-{CHILD_ID}.jsonl"));
+        std::fs::write(&parent, PARENT).unwrap();
+        std::fs::write(&child, CHILD).unwrap();
+        (parent, child)
+    }
+
+    /// A subagent's rollout opens with a copy of its parent's history (here:
+    /// the user's prompt, the spawn call and a 2000-token response). None of
+    /// it is the subagent's work, so none of it becomes its events.
+    #[test]
+    fn subagent_history_is_skipped() {
+        let dir = std::env::temp_dir().join(format!("aflow-codex-team-{}", std::process::id()));
+        let (parent, _) = write_team(&dir);
+        let evs = CodexAdapter::open(&parent).poll();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let child: Vec<&Event> = evs.iter().filter(|e| e.agent() == Some(CHILD_ID)).collect();
+        let usage: Vec<&str> = child
+            .iter()
+            .filter_map(|e| match &e.body {
+                Body::Usage { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage, ["resp_c1", "resp_c2"], "the parent's resp_p1 copy is not the child's");
+        let tools: Vec<&str> = child
+            .iter()
+            .filter_map(|e| match &e.body {
+                Body::ToolStarted { tool, .. } => Some(tool.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools, ["grep", "send_message"], "no copied spawn_agent call");
+        assert!(
+            !child.iter().any(|e| matches!(&e.body, Body::AgentSpawned { prompt, .. } if !prompt.is_empty())),
+            "the parent's prompt is not the child's task"
+        );
+        // spawned once, named by its nickname with its path as the tag
+        let spawn = child.iter().find(|e| matches!(e.body, Body::AgentSpawned { .. })).unwrap();
+        assert!(matches!(&spawn.body, Body::AgentSpawned { role, tag, parent: Some(p), alias, .. }
+            if role == "hypatia" && tag == "scan" && p == MAIN && alias == "/root/scan"));
+        assert!(child.iter().any(|e| matches!(&e.body, Body::Handoff { to, .. } if to == "/root")));
+        // one ordered stream: the spawn comes before the child's own records
+        assert!(evs.windows(2).all(|w| w[0].ts <= w[1].ts));
+    }
+
+    #[test]
+    fn team_session_renders_once_per_token() {
+        let dir = std::env::temp_dir().join(format!("aflow-codex-team-live-{}", std::process::id()));
+        let (parent, _) = write_team(&dir);
+        let mut live = Live::new(Box::new(CodexAdapter::open(&parent)) as Box<dyn SourceAdapter>, "h".into());
+        live.refresh();
+        let s = live.build(&Pricing::default());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!s.solo, "a subagent spawned: main is the orchestrator");
+        assert_eq!(s.orch_model, "luna");
+        assert_eq!(s.orch_calls.len(), 1);
+        assert_eq!(s.agents.len(), 1);
+        let a = &s.agents[0];
+        assert_eq!((a.name.as_str(), a.tag.as_str(), a.task.as_str()), ("hypatia", "scan", "scan"));
+        assert_eq!(a.calls.len(), 2);
+        assert_eq!(a.result.as_deref(), Some("Found 3 files."));
+        // parent 2000 in + 50 out; child 1000 in + 20 out, then 300 in + 1000 cached + 30 out
+        let want = (2000.0 * 0.10 + 50.0 * 0.50 + 1000.0 * 0.10 + 20.0 * 0.50 + 300.0 * 0.10 + 1000.0 * 0.01 + 30.0 * 0.50) / 1e6;
+        assert!((s.cost_at(i64::MAX) - want).abs() < 1e-12, "{} vs {want}", s.cost_at(i64::MAX));
+    }
+
+    /// Discovery picks the parent, never a subagent's rollout on its own, and
+    /// counts the subagent's writes as the parent's activity.
+    #[test]
+    fn discovery_skips_subagent_rollouts() {
+        let dir = std::env::temp_dir().join(format!("aflow-codex-team-find-{}", std::process::id()));
+        let (parent, child) = write_team(&dir);
+        let t = |secs: u64| SystemTime::now() - std::time::Duration::from_secs(secs);
+        File::options().write(true).open(&parent).unwrap().set_modified(t(600)).unwrap();
+        File::options().write(true).open(&child).unwrap().set_modified(t(5)).unwrap();
+        assert_eq!(find(&dir, None, Some(Path::new("/w/team")), false), Some(parent.clone()));
+        assert_eq!(find(&dir, None, None, true), Some(parent.clone()));
+        let act = activity(&dir, &parent);
+        assert!(act > t(60), "the busy subagent keeps the parent active");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

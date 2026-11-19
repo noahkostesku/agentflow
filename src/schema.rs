@@ -12,7 +12,8 @@
 //!     consumers merge: non-empty scalars replace, `ids` accumulate.
 //!   * the session's top-level thread is the agent [`MAIN`]. No agent spawns
 //!     it, but an adapter may emit `agent_spawned` for it (no `parent`) to
-//!     record what the user asked, again on each new prompt.
+//!     record what the user asked, again on each new prompt. It's the one
+//!     working agent until a subagent spawns, then the orchestrator.
 //!   * `tool_started` is emitted once per call id.
 
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,24 @@ impl Event {
         Event { v: VERSION, harness, session: session.to_string(), ts, body }
     }
 
+    /// Point an agent event at another agent (adapters build bodies for
+    /// [`MAIN`] and retarget them to a subagent). No-op on session events.
+    pub fn set_agent(&mut self, to: &str) {
+        match &mut self.body {
+            Body::SessionStarted { .. } => {}
+            Body::AgentSpawned { agent, .. }
+            | Body::ToolStarted { agent, .. }
+            | Body::ToolFinished { agent, .. }
+            | Body::Usage { agent, .. }
+            | Body::Output { agent, .. }
+            | Body::Handoff { agent, .. }
+            | Body::Waiting { agent, .. }
+            | Body::AgentFinished { agent, .. }
+            | Body::AgentError { agent, .. }
+            | Body::Heartbeat { agent } => *agent = to.to_string(),
+        }
+    }
+
     /// The agent this event is about (`None` for session-level events).
     pub fn agent(&self) -> Option<&str> {
         match &self.body {
@@ -101,8 +120,8 @@ pub enum Body {
         /// the project directory the harness ran in
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
-        /// the harness runs subagents under [`MAIN`], which then acts as the
-        /// orchestrator; when false, [`MAIN`] is the one working agent
+        /// the harness can run subagents under [`MAIN`] (informational: main
+        /// is the working agent until one actually spawns)
         #[serde(default)]
         subagents: bool,
     },
@@ -113,9 +132,13 @@ pub enum Body {
         /// the agent that dispatched it (usually [`MAIN`])
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent: Option<String>,
-        /// display name ("scout", "test-runner", …)
+        /// display name ("scout", "test-runner", "socrates", …)
         #[serde(default)]
         role: String,
+        /// a short dim tag shown after the name where there's room (Codex:
+        /// the agent's path, "repo_overview")
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        tag: String,
         /// the harness's own agent type ("Explore", "general-purpose", …)
         #[serde(default, skip_serializing_if = "String::is_empty")]
         agent_type: String,

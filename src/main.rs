@@ -32,6 +32,7 @@ use ratatui::Terminal;
 
 use adapters::SourceAdapter;
 use config::Config;
+use schema::Harness;
 use pricing::Pricing;
 use render::{Panel, View};
 
@@ -55,9 +56,10 @@ struct Cli {
     #[arg(long)]
     calm: bool,
 
-    /// Which harness's sessions to watch.
-    #[arg(long, value_enum, default_value_t = Source::Claude, global = true)]
-    source: Source,
+    /// Which harness's sessions to watch (default: the most recently active
+    /// session in any of them).
+    #[arg(long, value_enum, global = true)]
+    source: Option<Source>,
 
     /// Watch a specific session id instead of auto-detecting.
     #[arg(long, value_name = "ID", global = true)]
@@ -103,11 +105,34 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
-/// A harness agentflow can read.
+/// Where to look for sessions.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Source {
     Claude,
     Codex,
+    /// planned
+    Pi,
+    /// planned
+    Opencode,
+    /// planned
+    Gemini,
+    /// every supported harness
+    All,
+}
+
+impl Source {
+    /// The harnesses to search, or why there are none.
+    fn harnesses(source: Option<Source>) -> Result<Vec<Harness>, String> {
+        match source {
+            None | Some(Source::All) => Ok(discovery::SUPPORTED.to_vec()),
+            Some(Source::Claude) => Ok(vec![Harness::Claude]),
+            Some(Source::Codex) => Ok(vec![Harness::Codex]),
+            Some(other) => Err(format!(
+                "{} support is planned but not built yet (see docs/adapters.md)",
+                format!("{other:?}").to_lowercase()
+            )),
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -218,11 +243,15 @@ fn main() -> io::Result<()> {
         };
         return run_wrapped(range, export.as_deref(), slide.map(|n| (n, *at)));
     }
+    let harnesses = Source::harnesses(cli.source).unwrap_or_else(|why| {
+        eprintln!("agentflow: {why}");
+        std::process::exit(2);
+    });
     if let Some(Cmd::Events { once, .. }) = &cli.cmd {
-        let Some(target) = find(cli.source, cli.session.as_deref(), project.as_deref()) else {
-            no_session(cli.source, cli.session.as_deref());
+        let Some(found) = discovery::find(&harnesses, cli.session.as_deref(), Some(&cwd)) else {
+            no_session(&harnesses, cli.session.as_deref());
         };
-        return run_events(target.adapter, *once);
+        return run_events(found.open(), *once);
     }
 
     let panel = match cli.panel.as_deref() {
@@ -245,14 +274,14 @@ fn main() -> io::Result<()> {
     };
 
     if let Some(ms) = cli.synth {
-        let sess = demo::synth(header_for(&cwd));
+        let sess = demo::synth(header("demo", &cwd));
         print_ansi(&render::frame(&sess, ms, ms, &debug_view(&sess, ms, ms), &mut rng));
         return Ok(());
     }
 
     // --- Demo mode -------------------------------------------------------
     if cli.demo {
-        let sess = demo::session(header_for(&cwd), &set.pricing);
+        let sess = demo::session(header("demo", &cwd), &set.pricing);
         if let Some(ms) = cli.frame {
             print_ansi(&render::frame(&sess, ms, ms, &debug_view(&sess, ms, ms), &mut rng));
             return Ok(());
@@ -270,9 +299,9 @@ fn main() -> io::Result<()> {
     }
 
     // --- Live mode -------------------------------------------------------
-    match find(cli.source, cli.session.as_deref(), project.as_deref()) {
-        Some(target) => {
-            let live = open_live(cli.source, target.adapter, target.project_dir.as_deref(), &cwd);
+    match discovery::find(&harnesses, cli.session.as_deref(), Some(&cwd)) {
+        Some(found) => {
+            let live = open_live(&found, &cwd);
             if let Some(ms) = cli.frame {
                 let sess = live.build(&set.pricing);
                 let t = live.clock();
@@ -283,24 +312,24 @@ fn main() -> io::Result<()> {
             let mut follow = cli.session.is_none().then(|| Follow {
                 project: project.clone(),
                 cwd: cwd.clone(),
-                fell_back: target.fell_back,
+                fell_back: found.fell_back,
             });
-            let source = cli.source;
-            let mut next = |current: &Path| -> Option<live::Live> {
+            let mut next = |current: (Harness, &Path)| -> Option<live::Live> {
                 let fw = follow.as_mut()?;
-                let t = newer(source, fw, current)?;
-                fw.fell_back = t.fell_back;
-                Some(open_live(source, t.adapter, t.project_dir.as_deref(), &fw.cwd))
+                let dir = fw.project.clone().unwrap_or_else(|| fw.cwd.clone());
+                let f = discovery::newer(&harnesses, &dir, fw.fell_back, current)?;
+                fw.fell_back = f.fell_back;
+                Some(open_live(&f, &fw.cwd))
             };
             finish(run_live(live, &set, store, cli.calm, &mut next), warning)
         }
-        None if cli.session.is_some() || cli.source != Source::Claude => {
-            no_session(cli.source, cli.session.as_deref());
+        None if cli.session.is_some() || cli.source.is_some() => {
+            no_session(&harnesses, cli.session.as_deref());
         }
         None => {
             // Nothing to watch anywhere — fall back to the demo so the tool
             // still shows something recognizable.
-            let sess = demo::session(header_for(&cwd), &set.pricing);
+            let sess = demo::session(header("demo", &cwd), &set.pricing);
             if let Some(ms) = cli.frame {
                 print_ansi(&render::frame(&sess, ms, ms, &debug_view(&sess, ms, ms), &mut rng));
                 return Ok(());
@@ -310,54 +339,17 @@ fn main() -> io::Result<()> {
     }
 }
 
-/// A session found to watch, in any harness.
-struct Target {
-    adapter: Box<dyn SourceAdapter>,
-    /// absolute project directory (best effort)
-    project_dir: Option<PathBuf>,
-    /// nothing matched the project: the most recent session anywhere
-    fell_back: bool,
-}
-
-/// The session to watch in `source`: `--session` anywhere, else the most
-/// recent one for the project (default: cwd), else the most recent anywhere.
-fn find(source: Source, session: Option<&str>, project: Option<&Path>) -> Option<Target> {
-    match source {
-        Source::Claude => discovery::resolve(session, project).map(|r| Target {
-            adapter: (&r).into(),
-            project_dir: r.project_dir,
-            fell_back: r.fell_back,
-        }),
-        Source::Codex => {
-            let root = adapters::codex::sessions_root();
-            let dir = project.map(Path::to_path_buf).or_else(|| std::env::current_dir().ok());
-            let exact = adapters::codex::find(&root, session, dir.as_deref(), false);
-            let fell_back = exact.is_none() && session.is_none();
-            let path = exact.or_else(|| fell_back.then(|| adapters::codex::find(&root, None, None, true)).flatten())?;
-            Some(Target { adapter: Box::new(adapters::codex::CodexAdapter::open(&path)), project_dir: None, fell_back })
-        }
-    }
-}
-
-fn no_session(source: Source, session: Option<&str>) -> ! {
-    let place = match source {
-        Source::Claude => "~/.claude/projects".to_string(),
-        Source::Codex => adapters::codex::sessions_root().display().to_string(),
-    };
-    match session {
-        Some(id) => eprintln!("agentflow: no session \"{id}\" found under {place}"),
-        None => eprintln!("agentflow: no {} session found under {place}", source.name()),
-    }
+fn no_session(harnesses: &[Harness], session: Option<&str>) -> ! {
+    let places: Vec<String> = harnesses
+        .iter()
+        .map(|h| match h {
+            Harness::Claude => adapters::claude::projects_root().display().to_string(),
+            Harness::Codex => adapters::codex::sessions_root().display().to_string(),
+        })
+        .collect();
+    let what = session.map_or_else(|| "no session".to_string(), |id| format!("no session \"{id}\""));
+    eprintln!("agentflow: {what} found under {}", places.join(" or "));
     std::process::exit(1);
-}
-
-impl Source {
-    fn name(self) -> &'static str {
-        match self {
-            Source::Claude => "claude",
-            Source::Codex => "codex",
-        }
-    }
 }
 
 /// `agentflow events`: print each event as a JSON line, then keep polling.
@@ -394,21 +386,15 @@ fn finish(res: io::Result<()>, warning: Option<String>) -> io::Result<()> {
 /// Attach to a session and read what's already on disk. The header uses the
 /// real cwd the session reported (handles --session and the fallback, where
 /// Claude's storage dir name is path-encoded).
-fn open_live(source: Source, adapter: Box<dyn SourceAdapter>, project_dir: Option<&Path>, cwd: &Path) -> live::Live {
-    let mut live = live::Live::new(adapter, String::new());
+fn open_live(found: &discovery::Found, cwd: &Path) -> live::Live {
+    let mut live = live::Live::new(found.open(), String::new());
     live.refresh();
     let hdr_dir = live
         .cwd()
         .map(PathBuf::from)
-        .or_else(|| project_dir.map(Path::to_path_buf))
+        .or_else(|| found.project_dir.clone())
         .unwrap_or_else(|| cwd.to_path_buf());
-    live.set_header(match source {
-        Source::Claude => header_for(&hdr_dir),
-        other => {
-            let name = hdr_dir.file_name().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).unwrap_or("session");
-            format!("agentflow // {} // {name}", other.name())
-        }
-    });
+    live.set_header(header(found.harness.name(), &hdr_dir));
     live
 }
 
@@ -419,62 +405,21 @@ struct Follow {
     fell_back: bool,
 }
 
-/// Re-scan for a session that has become newer than the one we're watching.
-/// Started in a directory with sessions: only that directory's sessions are
-/// candidates. Started on the global fallback: a session appearing in our own
-/// directory (or a newer global one) wins. A candidate must have been active
-/// at least 5s more recently than the current session, so two sessions that
-/// are both busy don't make the view flip back and forth.
-fn newer_session(follow: &Follow, current: &Path) -> Option<discovery::Resolved> {
-    let cand = discovery::resolve(None, follow.project.as_deref())?;
-    if cand.path == current || (!follow.fell_back && cand.fell_back) {
-        return None;
-    }
-    let ahead = discovery::activity(&cand.path)
-        .duration_since(discovery::activity(current))
-        .unwrap_or_default();
-    (ahead >= Duration::from_secs(5)).then_some(cand)
+/// A newer Claude session to switch to (see `discovery::newer`).
+#[cfg(test)]
+fn newer_session(follow: &Follow, current: &Path) -> Option<discovery::Found> {
+    let dir = follow.project.clone().unwrap_or_else(|| follow.cwd.clone());
+    discovery::newer(&[Harness::Claude], &dir, follow.fell_back, (Harness::Claude, current))
 }
 
-/// A newer session to switch to, in any harness (see `newer_session`).
-fn newer(source: Source, follow: &Follow, current: &Path) -> Option<Target> {
-    match source {
-        Source::Claude => newer_session(follow, current).map(|r| Target {
-            adapter: (&r).into(),
-            project_dir: r.project_dir,
-            fell_back: r.fell_back,
-        }),
-        Source::Codex => {
-            let cand = find(source, None, follow.project.as_deref().or(Some(&follow.cwd)))?;
-            if cand.adapter.path() == current || (!follow.fell_back && cand.fell_back) {
-                return None;
-            }
-            let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
-            let ahead = mtime(cand.adapter.path()).duration_since(mtime(current)).unwrap_or_default();
-            (ahead >= Duration::from_secs(5)).then_some(cand)
-        }
-    }
-}
-
-/// Build the header "agentflow // <project> // <hash>" from a directory.
-fn header_for(dir: &Path) -> String {
+/// The header "agentflow // <harness> // <project>".
+fn header(label: &str, dir: &Path) -> String {
     let name = dir
         .file_name()
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
         .unwrap_or("session");
-    let hash = short_hash(&dir.to_string_lossy());
-    format!("agentflow // {name} // {hash}")
-}
-
-/// FNV-1a over the path, folded to 4 lowercase hex chars (stands in for a sid).
-fn short_hash(s: &str) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{:04x}", (h ^ (h >> 32)) as u16)
+    format!("agentflow // {label} // {name}")
 }
 
 // ---- terminal setup / teardown ---------------------------------------------
@@ -775,7 +720,7 @@ fn run_live(
     set: &Settings,
     store: lifetime::Store,
     calm: bool,
-    next: &mut dyn FnMut(&Path) -> Option<live::Live>,
+    next: &mut dyn FnMut((Harness, &Path)) -> Option<live::Live>,
 ) -> io::Result<()> {
     let mut term = enter()?;
     let mut rng = rand::thread_rng();
@@ -793,7 +738,7 @@ fn run_live(
             // Every ~2s, hop to a newer session (unless pinned by --session).
             if last_scan.elapsed() >= Duration::from_secs(2) {
                 last_scan = Instant::now();
-                if let Some(newer) = next(live.path()) {
+                if let Some(newer) = next((live.harness(), live.path())) {
                     persist.flush();
                     live = newer;
                     sess = live.build(&set.pricing);

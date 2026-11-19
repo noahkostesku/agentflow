@@ -1,7 +1,7 @@
 //! Color palette. Terminal background only; one muted accent (dusty mauve by
 //! default, configurable); soft amber = waiting; soft red = error. A grayscale
-//! ramp plus the accent and tints derived from it. One palette (the site's,
-//! see docs/agentflow-orbit-mockup.html) for every view.
+//! ramp plus the accent and tints derived from it. One palette (the site's)
+//! for every view.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -22,7 +22,7 @@ pub const AM: Color = Color::Rgb(0xd4, 0xb4, 0x83);
 /// soft red #d48a8a — errors, a validator's fail
 pub const RED: Color = Color::Rgb(0xd4, 0x8a, 0x8a);
 
-// Orbit view (docs/agentflow-orbit-mockup.html palette).
+// Orbit view palette.
 /// ring #262626 — the orbit ring's dots
 pub const RING: Color = Color::Rgb(0x26, 0x26, 0x26);
 /// dim #3a3a3a — spokes, faded chords, idle agents

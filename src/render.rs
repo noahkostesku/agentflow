@@ -969,7 +969,16 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'stat
         let end = a.finish.unwrap_or(t).min(t);
         let crit = critical.contains(i);
         let on = if crit { light() } else { ac() };
-        let mut l = vec![sp(" ", D), rarity_span(&a.model, false), sp(pad(&a.name, LABEL - 3), if crit { B } else { G })];
+        let mut l = vec![sp(" ", D), rarity_span(&a.model, false)];
+        // "socrates · repo_overview": the tag dim after the name, clipped
+        let room = LABEL - 3;
+        if a.tag.is_empty() || clen(&a.name) + 4 > room {
+            l.push(sp(pad(&a.name, room), if crit { B } else { G }));
+        } else {
+            l.push(sp(a.name.clone(), if crit { B } else { G }));
+            let w = room - clen(&a.name);
+            l.push(sp(pad(&clip(&format!(" · {}", a.tag), w - 1), w), D));
+        }
         let err_cell = a.error_at.filter(|_| a.error).filter(|e| *e <= t).map(cell_of);
         // idle span: from when it went quiet (+ threshold) until now
         let idle_from = stats::stuck_idle(a, t, view.stuck_ms).map(|idle| t - idle + view.stuck_ms);
@@ -1081,6 +1090,9 @@ fn detail_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'static
         sp(if glyph.is_empty() { String::new() } else { format!("{glyph} ") }, rarity_color(&a.model, false)),
         sp(a.name.clone(), B),
     ];
+    if !a.tag.is_empty() {
+        left.push(sp(format!(" · {}", a.tag), D));
+    }
     let mut meta = Vec::new();
     if !a.model.is_empty() {
         meta.push(if tier.is_empty() { a.model.clone() } else { format!("{} · {tier}", a.model) });

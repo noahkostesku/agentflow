@@ -26,6 +26,8 @@ const WAIT_MS: i64 = 10_000;
 #[derive(Default)]
 struct Acc {
     role: String,
+    /// dim tag after the name
+    tag: String,
     agent_type: String,
     task: String,
     prompt: String,
@@ -75,8 +77,6 @@ pub struct Live {
     session: Option<String>,
     cwd: Option<String>,
     harness: Option<Harness>,
-    /// `main` orchestrates subagents (true) or is the one working agent
-    subagents: bool,
     /// keyed by agent id; [`MAIN`] holds the orchestrator's calls
     accs: HashMap<String, Acc>,
     next_order: usize,
@@ -92,7 +92,6 @@ impl Live {
             session: None,
             cwd: None,
             harness: None,
-            subagents: true,
             accs: HashMap::new(),
             next_order: 0,
             opened: now_ms(),
@@ -102,6 +101,11 @@ impl Live {
     /// The primary file of the session this watcher is attached to.
     pub fn path(&self) -> &Path {
         self.src.path()
+    }
+
+    /// The harness the session comes from.
+    pub fn harness(&self) -> Harness {
+        self.src.harness()
     }
 
     /// The session's project directory, once `session_started` named it.
@@ -124,10 +128,9 @@ impl Live {
     pub fn apply(&mut self, ev: &schema::Event) {
         let ts = ev.ts;
         let Some(agent) = ev.agent() else {
-            if let Body::SessionStarted { cwd, subagents } = &ev.body {
+            if let Body::SessionStarted { cwd, .. } = &ev.body {
                 self.session = Some(ev.session.clone());
                 self.harness = Some(ev.harness);
-                self.subagents = *subagents;
                 if cwd.is_some() {
                     self.cwd = cwd.clone();
                 }
@@ -144,13 +147,14 @@ impl Live {
         }
         match &ev.body {
             Body::SessionStarted { .. } => {}
-            Body::AgentSpawned { role, agent_type, task, prompt, alias, ids, .. } => {
+            Body::AgentSpawned { role, tag, agent_type, task, prompt, alias, ids, .. } => {
                 let set = |dst: &mut String, v: &String| {
                     if !v.is_empty() {
                         dst.clone_from(v);
                     }
                 };
                 set(&mut acc.role, role);
+                set(&mut acc.tag, tag);
                 set(&mut acc.agent_type, agent_type);
                 set(&mut acc.task, task);
                 set(&mut acc.prompt, prompt);
@@ -167,7 +171,7 @@ impl Live {
             Body::ToolStarted { call, label, kind, tool, file, edit, arg, blocking, test, .. } => {
                 acc.denied = false; // it moved on: not stuck on the denial
                 acc.waiting = None;
-                // `main` finishes every turn in a harness without subagents;
+                // `main` finishes every turn while it's the working agent;
                 // its next tool call means it's working again. (Subagents
                 // don't reopen: their own records can arrive after a finish
                 // their parent reported.)
@@ -261,7 +265,10 @@ impl Live {
     /// Build the render model for the current instant.
     pub fn build(&self, pricing: &Pricing) -> Session {
         // `main` is a row only when it's the one working agent
-        let rows = |k: &str| k != MAIN || !self.subagents;
+        // `main` is the working row until a subagent spawns; from then on
+        // it's the orchestrator above them
+        let orchestrated = self.orchestrated();
+        let rows = |k: &str| k != MAIN || !orchestrated;
         let mut accs: Vec<(&str, &Acc)> =
             self.accs.iter().filter(|(k, _)| rows(k)).map(|(k, a)| (k.as_str(), a)).collect();
         accs.sort_by_key(|(_, a)| (a.spawn_ms.or(a.first_ts).unwrap_or(i64::MAX), a.order));
@@ -269,12 +276,12 @@ impl Live {
 
         let now = now_ms();
         let t0 = self.origin().unwrap_or(now);
-        let boss = if self.subagents { "orchestrator" } else { "you" };
+        let boss = if orchestrated { "orchestrator" } else { "you" };
 
         let mut agents = Vec::new();
         let mut events: Vec<Event> = Vec::new();
         for &(key, a) in &accs {
-            // the one agent of a harness without subagents goes by the harness
+            // the working main agent goes by its harness ("claude", "codex")
             let role = match (key == MAIN, self.harness) {
                 (true, Some(h)) if a.role.is_empty() => h.name().to_string(),
                 (true, None) if a.role.is_empty() => "agent".to_string(),
@@ -385,6 +392,7 @@ impl Live {
                     a.pending.iter().map(|(_, ts, _)| *ts).min().map(|ts| ts - t0)
                 },
                 prompt: a.prompt.clone(),
+                tag: a.tag.clone(),
                 ids: std::iter::once(key.to_string()).chain(a.ids.iter().cloned()).collect(),
             });
         }
@@ -434,7 +442,7 @@ impl Live {
             events.drain(0..events.len() - keep);
         }
 
-        let main = self.accs.get(MAIN).filter(|_| self.subagents);
+        let main = self.accs.get(MAIN).filter(|_| orchestrated);
         // models with billed tokens but no price: they count as $0, flagged
         let mut unpriced: Vec<String> = self
             .accs
@@ -458,15 +466,21 @@ impl Live {
             epoch0: Some(t0),
             handoffs,
             unpriced,
-            solo: !self.subagents,
+            solo: !orchestrated,
         }
+    }
+
+    /// Some subagent exists: `main` is the orchestrator, not a working row.
+    fn orchestrated(&self) -> bool {
+        self.accs.keys().any(|k| k != MAIN)
     }
 
     /// Earliest spawn we know about.
     fn origin(&self) -> Option<i64> {
+        let orchestrated = self.orchestrated();
         self.accs
             .iter()
-            .filter(|(k, _)| *k != MAIN || !self.subagents)
+            .filter(|(k, _)| *k != MAIN || !orchestrated)
             .filter_map(|(_, a)| a.spawn_ms.or(a.first_ts))
             .min()
     }
@@ -547,6 +561,7 @@ mod tests {
                 agent: agent.into(),
                 parent: Some(MAIN.into()),
                 role: role.into(),
+                tag: String::new(),
                 agent_type: String::new(),
                 task: String::new(),
                 prompt: String::new(),

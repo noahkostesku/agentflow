@@ -144,6 +144,9 @@ pub struct Agent {
     pub prompt: String,
     /// ids another agent's prompt may quote: spawn tool_use id, agentId
     pub ids: Vec<String>,
+    /// short dim tag shown after the name where there's room (Codex: the
+    /// agent's path role, "repo_overview")
+    pub tag: String,
 }
 
 /// Rarity by model family: (glyph, name). haiku common, sonnet rare,

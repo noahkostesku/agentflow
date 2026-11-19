@@ -77,6 +77,10 @@ agentflow --source codex     # only Codex sessions
 agentflow --source all       # every harness's session for this directory, together
 agentflow --demo             # looping scripted demo (no session needed)
 agentflow --demo --source all  # the demo with Claude Code and Codex side by side
+agentflow inbox              # every active session, any project: which one needs you
+agentflow inbox --notify     # the same, plus a desktop notification when one does
+agentflow notify             # just the notifications, no TUI (run it in the background)
+agentflow inbox --demo       # a scripted inbox, sessions in every state
 agentflow wrapped            # your month with agents, as eight animated slides
 agentflow events --json      # the session as normalized JSON events, live
 ```
@@ -95,8 +99,8 @@ agentflow events --json      # the session as normalized JSON events, live
 **Controls:** `q` quit · `v` cycle views (tree → orbit → timeline) · `↑`/`↓` select
 an agent · `Enter` agent details · `Esc` back (out of a panel, then clears the
 selection, then back to the tree, then quits) · `s` stats · `t` timeline · `l` lifetime ·
-`?` key hints · `c` toggle calm · `space` pause (demo) · `r` restart (demo) / refresh
-now (live). The key hints show for ~3s on startup and on `?`.
+`i` inbox · `?` key hints · `c` toggle calm · `space` pause (demo) · `r` restart (demo) /
+refresh now (live). The key hints show for ~3s on startup and on `?`.
 
 ## Views
 
@@ -160,6 +164,160 @@ This is display only. agentflow just reads transcripts, so naming a validator
 changes how it's drawn and gates nothing in your harness. None are set by default;
 `--demo` shows the two above so you can see what they look like.
 
+## Inbox: which agent needs you
+
+For when you run many agents at once, across projects and harnesses.
+`agentflow inbox` (or `i` from any view) lists every session written to in
+the last 30 minutes, in any project and any supported harness, one line
+each, the ones that need you first:
+
+```
+ agentflow // inbox        2 need you · 1 error · 1 stuck · 1 done · 2 working
+ ─────────────────────────────────────────────────────────────────────────────
+› ? (·_·)  claude  payments-api  $ cargo publish --dry…   1/3  4m 13s   ≈$1.84
+  ? (·_·)  codex   infra         question: deploy to s…           42s   ≈$0.31
+  ✗ (×_×)  claude  web-app       denied $ rm -rf node_…        1m 36s   ≈$0.22
+  z (-_-)  codex   data-pipeline last: $ python etl.py…   1/2  6m 21s   ≈$0.67
+  ✓ (^‿^)  claude  docs-site     Rewrote the quickstar…   0/2  1m 03s   ≈$0.48
+  ⠏ (•‿•)  claude  agentflow     reviewer: read inbox.…   2/4 12m 15s   ≈$2.91
+  ⠸ (•‿•)  codex   mobile        $ npm test -- --watch…        2m 09s   ≈$0.12
+  ○ (·.·)  codex   scratch       closed while waiting …        1h 05m   ≈$0.09
+  · (-‿-)  claude  dotfiles      Switched the prompt t…       25m 01s   ≈$0.05
+```
+
+| state | glyph | means |
+|-------|-------|-------|
+| waiting | `?` amber | blocked on you: an approval prompt, a question, a plan to approve |
+| error | `✗` soft red | a tool call was denied or rejected |
+| stuck | `z` dim amber | still running, but quiet past `stuck_after` with nothing in flight |
+| done | `✓` mauve | the turn is over and you haven't reviewed it |
+| working | spinner | busy |
+| closed | `○` dim | was waiting or working, but its `claude` / `codex` process is gone (see below) |
+| idle | `·` dim | reviewed, or nothing has happened in it yet |
+
+Each line: the state's glyph and face, harness, project, what it's doing or
+waiting on (the call, the question, the error, or its last message), agents
+still running / total (when it has subagents), how long it's been in this
+state, and the ≈cost so far. Within a state, whoever has waited longest is
+first. The header counts each state.
+
+`↑`/`↓` select (`j`/`k` too) · `Enter` opens the session in the usual
+tree/orbit/timeline view · `Esc` from there comes back to the inbox · `r`
+marks a done (or errored) session reviewed, so it drops to idle until it
+finishes again · `q` quits. Reviewed marks are kept in
+`~/.agentflow/reviewed.json` (never in a harness's directory); marks older than
+two weeks are dropped.
+
+Activity is the session's own: its last recorded event, subagents included,
+not the file's modified time (Claude Code appends bookkeeping records to
+transcripts long after the work ends). A session that's waiting on you or in
+error stays listed after it goes quiet. Change the window with `--active
+<minutes>` or `[inbox] active_minutes`. `--source claude` / `--source codex`
+narrows it to one harness.
+
+**Closed sessions.** Close a terminal (or kill the process) while its
+session is waiting on you and the transcript just stops: on disk it looks
+like it's still waiting. So every 10 seconds the inbox looks at the running
+`claude` and `codex` processes (`ps`, and their working directory from
+`lsof` on macOS or `/proc` on Linux). A process whose command line names a
+session (`claude --resume <id>`) keeps that session live; otherwise, with
+`n` processes of a harness in a directory, that harness's `n` most recently
+active sessions there are the live ones (one sitting at its prompt counts).
+A waiting, working or stuck session left without a process shows dim as
+`closed while waiting` (or `working`), sorts below working, isn't counted in
+the header, never notifies, and leaves the inbox with the active window.
+Where processes can't be seen (no `ps`, a sandbox, a directory it can't
+read), it falls back to age: one quiet for 12 hours or more reads
+`stale while waiting`.
+
+How waiting is detected, since neither harness records an approval prompt
+while it's open:
+
+- **Questions and plans** are exact: Claude Code's `AskUserQuestion` and
+  `ExitPlanMode`, Codex's `request_user_input`. The line shows the question.
+- **Approval prompts** are inferred: a call that can prompt hasn't returned
+  for 10s. Which calls can prompt follows what each harness records about
+  its permissions, so a slow build isn't mistaken for a prompt:
+  - Claude Code's permission mode. In `auto` mode an edit still can (it
+    returns at once unless you're being asked), but a shell command doesn't
+    count: auto mode asks about ~3% of shell calls, while ~6% of the ones it
+    lets through run longer than 10s, so a slow one is almost always just
+    running. In `bypassPermissions` nothing can; in `acceptEdits` edits
+    can't; in `default` and `plan` shell commands, edits and web calls can.
+  - Codex's approval policy. Under `on-request` (its default) only a command
+    that asks for escalated permissions can, and a patch only in a read-only
+    sandbox; under `never`, nothing; under `untrusted`, any.
+
+  A prompt the harness raises anyway (auto mode asking about a shell call)
+  shows as working, with its time in that state growing.
+
+## Notifications
+
+`agentflow notify` runs without a TUI and sends a desktop notification when
+a session starts waiting on you, hits an error, gets stuck, or finishes:
+`osascript` on macOS, `notify-send` on Linux (if installed; otherwise it says
+so and just prints). Each one is also printed to stdout with the time.
+`agentflow inbox --notify` does the same while the inbox is open (and while
+you're in a session you opened from it).
+
+- One notification per state change per session. A state that holds never
+  repeats.
+- Starting it is silent: sessions already waiting or done when it starts
+  don't fire. A session that shows up later, already waiting, does.
+- A session that flips back into the same state within `repeat_after`
+  seconds (default 300) isn't notified again. A slow command can flip a
+  session between working and waiting.
+- Per-state toggles and quiet hours are in the config (below). A change during
+  quiet hours is dropped, not saved for later.
+
+```sh
+agentflow notify --dry-run   # print what it would send, send nothing
+agentflow notify --once      # every active session's state, then exit
+```
+
+**Running it in the background.** In tmux:
+
+```sh
+tmux new -d -s agentflow-notify 'agentflow notify'
+```
+
+Or as a macOS login item with launchd. Save this as
+`~/Library/LaunchAgents/dev.agentflow.notify.plist`, with the path from
+`which agentflow`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.agentflow.notify</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/agentflow</string>
+    <string>notify</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/agentflow-notify.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/agentflow-notify.log</string>
+</dict>
+</plist>
+```
+
+```sh
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.agentflow.notify.plist   # start (and at every login)
+launchctl bootout gui/$(id -u)/dev.agentflow.notify                                # stop
+```
+
+macOS shows `osascript` notifications as coming from Script Editor. If none
+appear, allow Script Editor in System Settings → Notifications. If you use
+`$CODEX_HOME`, add it under an `EnvironmentVariables` key in the plist.
+
 ## Agents up close
 
 **Rarity** comes from the model and sits just before each agent's name:
@@ -179,10 +337,10 @@ first lines of its final result. `Esc` goes back.
 
 **Stuck alert** — a running agent whose transcript has gone quiet for 2+ minutes
 dozes off: `(-_-)` with a slow `z z z` drifting up into the row above, and
-`idle 2m` in amber. Any new transcript entry wakes it. Set the threshold with
+`idle 2m 05s` in amber. Any new transcript entry wakes it. Set the threshold with
 `stuck_after` (seconds; `0` turns it off). An agent with a tool call still in
 flight (a slow build or test run: a `tool_use` with no `tool_result` yet) isn't
-stuck: it stays awake and reads `running 2m` with a slow spinner. It only dozes
+stuck: it stays awake and reads `busy 2m 05s` with a slow spinner. It only dozes
 when nothing is in flight.
 
 ## Cost, stats & achievements
@@ -274,6 +432,17 @@ accent = "#c4a5b4"    # the one accent color (dusty mauve)
 stuck_after = 120     # seconds of silence before an agent dozes (0 = off)
 validators = ["test-runner", "reviewer"]  # optional: pass/fail labels in the orbit (default: none)
 
+[inbox]
+active_minutes = 30   # a session written to this recently shows in the inbox
+
+[notify]              # `agentflow notify` and `inbox --notify`
+waiting = true        # it's waiting on you (a prompt, a question, a plan)
+error = true          # a tool call was denied or rejected
+stuck = true          # quiet past stuck_after with nothing in flight
+done = true           # it finished its turn
+quiet = "22:00-08:00" # no notifications in this local-time window (default: none)
+repeat_after = 300    # seconds before the same state re-notifies a session (0 = always)
+
 [pricing.opus]        # USD per million tokens; key by family or exact model id
 input = 4.0           # unset fields keep the built-in rate
 output = 20.0
@@ -300,7 +469,7 @@ types out). `space` / `→` next, `←` back, `q` quit:
    personality, runs
 5. **your busiest hours** — a braille bar chart of tool calls by hour of day
 6. **time saved** — total agent time vs the wall-clock it took, as two bars
-   ("11h20m of agent work in 6h05m"), and the difference: time saved by running
+   ("11h 20m of agent work in 6h 5m"), and the difference: time saved by running
    agents in parallel
 7. **orchestrator type** — from average agents per session: soloist (≤1),
    duo (~2), conductor (3–4), swarm lord (5+)
@@ -322,7 +491,8 @@ they already write (Claude Code's transcripts under `~/.claude/projects/`,
 Codex's rollouts under `~/.codex/sessions/`) and renders them at ~20fps. It
 installs no hooks, writes nothing to any harness's directories, and never
 touches your sessions. Its only writes are its own `~/.agentflow/config.toml`
-(created once) and, with `persistence` on, `~/.agentflow/lifetime.json`.
+(created once), with `persistence` on `~/.agentflow/lifetime.json`, and the
+inbox's reviewed marks, `~/.agentflow/reviewed.json`.
 
 Each harness has an **adapter** that translates its files into one normalized,
 versioned [event schema](docs/schema.md). Every view, stat and feature reads
@@ -392,9 +562,10 @@ it returns.
 
 > Note on live waiting/error states: neither harness records a permission prompt
 > while it's open, so agentflow can't see one as it happens. It shows **waiting**
-> when a tool call (shell, edit, web) hasn't returned for ~10s — that could be a
-> permission prompt or just a slow command — and **error** when a tool was denied
-> or blocked. Both are best-effort from read-only session files, no hooks.
+> at once for a question or a plan to approve, and when a call that can prompt
+> (under the session's permission mode or approval policy; see *Inbox*) hasn't
+> returned for ~10s. It shows **error** when a tool was denied or rejected. Both
+> are best-effort from read-only session files, no hooks.
 
 ## Why
 

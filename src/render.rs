@@ -17,6 +17,7 @@ use ratatui::text::{Line, Span};
 use crate::lifetime::Totals;
 use crate::model::{rarity, Agent, Session, Tool, ToolKind};
 use crate::pricing::{approx_cost, fmt_cost, fmt_delta, fmt_tokens};
+use crate::duration::{compact, human};
 use crate::stats;
 use crate::theme::*;
 
@@ -27,6 +28,8 @@ const W: i64 = 64;
 const BADGE: i64 = 7;
 /// per-agent cost column at the end of each row
 const COST: i64 = 8;
+/// progress bar cells in a tree row
+const BAR: i64 = 7;
 /// Frame height in lines (16 + the hint footer).
 pub const H: u16 = 17;
 /// The recap card appears this long after the last agent finishes, so the
@@ -93,16 +96,16 @@ pub fn recap_due(sess: &Session, t: i64) -> bool {
 
 pub(crate) const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-fn sp<S: Into<String>>(s: S, c: Color) -> Span<'static> {
+pub(crate) fn sp<S: Into<String>>(s: S, c: Color) -> Span<'static> {
     Span::styled(s.into(), Style::default().fg(c))
 }
 
-fn clen(s: &str) -> usize {
+pub(crate) fn clen(s: &str) -> usize {
     s.chars().count()
 }
 
 /// Right-pad with spaces to `n` chars, or truncate to `n`. Mirrors JS `pad`.
-fn pad(s: &str, n: usize) -> String {
+pub(crate) fn pad(s: &str, n: usize) -> String {
     let len = clen(s);
     if len >= n {
         s.chars().take(n).collect()
@@ -112,7 +115,7 @@ fn pad(s: &str, n: usize) -> String {
 }
 
 /// Left-pad with spaces to `n` chars. Mirrors JS `lpad`.
-fn lpad(s: &str, n: usize) -> String {
+pub(crate) fn lpad(s: &str, n: usize) -> String {
     let len = clen(s);
     if len >= n {
         s.to_string()
@@ -121,7 +124,7 @@ fn lpad(s: &str, n: usize) -> String {
     }
 }
 
-fn ctake(s: &str, n: usize) -> String {
+pub(crate) fn ctake(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
@@ -264,7 +267,7 @@ fn row(
     // Silent for a while: sleepy instead of busy (overrides "waiting")…
     let stuck = if boot { None } else { stats::stuck_idle(a, t, view.stuck_ms) };
     // …unless a tool call is still in flight: then it's a long-running
-    // command, so it reads "running 2m" with a slow spinner, awake.
+    // command, so it reads "busy 2m 05s" with a slow spinner, awake.
     let running = if boot { None } else { stats::running_long(a, t, view.stuck_ms) };
     let wait = running.is_none() && (stuck.is_some() || a.wait.is_some_and(|(ws, we)| t >= ws && t < we));
     // ~300ms glitch the moment an error lands (spec: "Error: ~300ms glitch").
@@ -336,7 +339,8 @@ fn row(
     } else {
         face = if (t / 300) % 2 != 0 { "(•o•)" } else { "(•‿•)" }.into();
     }
-    s.push(sp(pad(&face, 8), fc));
+    // faces are at most 6 wide ("(•_• )"): one column of air after
+    s.push(sp(pad(&face, 7), fc));
 
     // Status word.
     let st;
@@ -374,7 +378,9 @@ fn row(
 
     // Spinner / sparkle cell.
     let mut s1 = " ".to_string();
-    if !boot && !done && !wait && !ret && !a.error {
+    // a status that fills its column ("busy 17m 55s") gets no spinner, so
+    // the two never touch
+    if !boot && !done && !wait && !ret && !a.error && clen(&st) < 12 {
         // a long-running call spins slowly
         let step = if running.is_some() { 400 } else { 80 };
         s1 = SPIN[((t / step + a.bob).rem_euclid(10)) as usize].to_string();
@@ -390,13 +396,12 @@ fn row(
     // Elapsed time. Demo scales ×3 for liveliness; live shows real seconds.
     let scale = if live { 1.0 } else { 3.0 };
     let end = fo.unwrap_or(t);
-    let secs = (t.min(end) - a.spawn).max(0) as f64 / 1000.0 * scale;
-    s.push(sp(
-        format!("{}  ", lpad(&format!("{}s", secs.floor() as i64), 5)),
-        if dim { D } else { G },
-    ));
+    let ms = ((t.min(end) - a.spawn).max(0) as f64 * scale) as i64;
+    // always a column of air after the spinner and before the bar, however
+    // wide the time gets ("17m 55s" is 7)
+    s.push(sp(format!(" {} ", lpad(&human(ms), 7)), if dim { D } else { G }));
 
-    // Progress bar.
+    // Progress bar, 7 cells (the elapsed field needs the eighth for "17m 55s").
     let pr = if done {
         1.0
     } else if let Some(f) = fo {
@@ -407,15 +412,15 @@ fn row(
         let e = (t - act).max(0) as f64;
         (0.85 * (1.0 - (-e / 9000.0).exp())).clamp(0.0, 0.85)
     };
-    let cells = (pr * 8.0).round() as i64;
+    let cells = (pr * BAR as f64).round() as i64;
     let shine = match fo {
         Some(f) if t >= f + 400 && t < f + 800 => {
-            ((t - f - 400) as f64 / 400.0 * 8.0).floor() as i64
+            ((t - f - 400) as f64 / 400.0 * BAR as f64).floor() as i64
         }
         _ => -1,
     };
     let bar_done = if dim { D } else if a.error { RED } else { ac() };
-    for i in 0..8 {
+    for i in 0..BAR {
         if i < cells {
             s.push(sp("⣿", if i == shine { wh() } else { bar_done }));
         } else if i == cells && !boot && !wait && !a.error {
@@ -619,20 +624,32 @@ fn root_row(sess: &Session, t: i64, app_t: i64) -> Line<'static> {
     } else if sess.agents.is_empty() {
         "waiting".to_string()
     } else {
-        format!("delegating {}", SPIN[((t / 80).rem_euclid(10)) as usize])
+        root_working(sess, t)
     };
     let mut o = vec![
         sp(" ◆ ", ac()),
         sp(pad(sess.root_name(), 13), B),
         sp(pad(&sess.orch_model, BADGE as usize), D),
         sp(pad(of, 8), if t >= all || fl.is_some() { ac() } else { G }),
-        sp(pad(&os, 14), if t >= all { ac() } else { G }),
+        sp(pad(&os, 20), if t >= all { ac() } else { G }),
     ];
     if let Some(fl) = fl {
         let f = fl.finish.unwrap();
         o.push(sp(format!("+{}", fl.size), if t - f - 400 < 600 { ac() } else { D }));
     }
     Line::from(o)
+}
+
+/// What the root is doing while its agents work: an orchestrator is
+/// "delegating"; "you", with one agent and no subagents, are "waiting on
+/// claude" (the harness's agent). Both with a spinner.
+pub(crate) fn root_working(sess: &Session, t: i64) -> String {
+    let spin = SPIN[((t / 80).rem_euclid(10)) as usize];
+    if !sess.solo {
+        return format!("delegating {spin}");
+    }
+    let who = sess.harness.map(|h| h.name().to_string()).or_else(|| sess.agents.first().map(|a| a.name.clone()));
+    format!("waiting on {} {spin}", who.unwrap_or_else(|| "agent".into()))
 }
 
 /// A group's dim harness label, with its share of the cost on the right.
@@ -873,7 +890,7 @@ fn recap_lines(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'static>
         None => kv("mvp", "·".into(), String::new()),
     });
     out.push(match &r.longest {
-        Some((name, ms)) => kv("longest", name.clone(), format!("{}s", ms / 1000)),
+        Some((name, ms)) => kv("longest", name.clone(), compact(*ms)),
         None => kv("longest", "·".into(), String::new()),
     });
     let hit = format!("{:.0}% hit", r.hit * 100.0);
@@ -1054,7 +1071,7 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64, h: usize) -> Vec<
     let par = stats::parallelism(&sess.agents, t);
     let mut right = work_in_wall(&par, scale);
     if par.saved_ms() > 0 {
-        right += &format!(" · saved {}", dur((par.saved_ms() as f64 * scale / 1000.0) as i64));
+        right += &format!(" · saved {}", compact((par.saved_ms() as f64 * scale) as i64));
     }
     let mut out = vec![rule("timeline", &right, w)];
 
@@ -1187,8 +1204,8 @@ fn timeline_panel(sess: &Session, t: i64, view: &View, w: i64, h: usize) -> Vec<
     // time axis: labels at 0, ¼, ½, ¾ and the end
     let mut axis: Vec<char> = vec![' '; cells];
     for k in 0..=4usize {
-        let secs = (span as f64 * scale / 1000.0 * k as f64 / 4.0) as i64;
-        let label: Vec<char> = dur(secs).chars().collect();
+        let ms = (span as f64 * scale * k as f64 / 4.0) as i64;
+        let label: Vec<char> = compact(ms).chars().collect();
         let pos = (cells - 1) * k / 4;
         let start = if k == 4 { pos + 1 - label.len() } else { pos.min(cells - label.len()) };
         if k > 0 && axis[start.saturating_sub(1)..(start + label.len()).min(cells)].iter().any(|c| *c != ' ') {
@@ -1226,8 +1243,8 @@ fn work_in_wall(p: &stats::Parallelism, scale: f64) -> String {
     if p.work_ms <= 0 {
         return String::new();
     }
-    let secs = |ms: i64| (ms as f64 * scale / 1000.0) as i64;
-    format!("{} of work in {}", dur(secs(p.work_ms)), dur(secs(p.wall_ms)))
+    let shown = |ms: i64| compact((ms as f64 * scale) as i64);
+    format!("{} of work in {}", shown(p.work_ms), shown(p.wall_ms))
 }
 
 /// "peak 3 agents · avg 1.7× · 2+ active 42%"
@@ -1269,7 +1286,7 @@ fn detail_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'static
         ("working".to_string(), G)
     };
     let end = a.finish.unwrap_or(t).min(t);
-    let secs = ((end - a.spawn).max(0) as f64 * sess.scale() / 1000.0) as i64;
+    let took = ((end - a.spawn).max(0) as f64 * sess.scale()) as i64;
     let mut left = vec![
         sp("‹ ", ac()),
         sp(if glyph.is_empty() { String::new() } else { format!("{glyph} ") }, rarity_color(&a.model, false)),
@@ -1292,7 +1309,7 @@ fn detail_panel(sess: &Session, t: i64, view: &View, w: i64) -> Vec<Line<'static
     if !meta.is_empty() {
         left.push(sp(format!("   {}", meta.join(" · ")), D));
     }
-    let mut right = vec![sp(state, sc), sp(format!(" · {}", dur(secs)), G)];
+    let mut right = vec![sp(state, sc), sp(format!(" · {}", compact(took)), G)];
     if view.cost {
         right.push(sp(format!(" · {}", fmt_cost(a.cost_at(t))), G));
     }
@@ -1364,33 +1381,15 @@ pub(crate) fn clip(s: &str, n: usize) -> String {
     }
 }
 
-/// "running 45s", "running 2m", "running 1h"
+/// A call in flight this long: "busy 45s", "busy 17m 55s", "busy 1h 02m".
+/// At most 12 wide, the tree's status column (the orbit's label is 13).
 pub(crate) fn running_label(ms: i64) -> String {
-    format!("running {}", short_dur(ms))
+    format!("busy {}", human(ms))
 }
 
-/// "45s", "2m", "1h"
-fn short_dur(ms: i64) -> String {
-    let s = ms / 1000;
-    if s < 60 {
-        format!("{s}s")
-    } else if s < 3600 {
-        format!("{}m", s / 60)
-    } else {
-        format!("{}h", s / 3600)
-    }
-}
-
-/// "idle 45s", "idle 2m", "idle 1h"
+/// Silent this long: "idle 45s", "idle 17m 55s", "idle 1h 02m".
 pub(crate) fn idle_label(ms: i64) -> String {
-    let s = ms / 1000;
-    if s < 60 {
-        format!("idle {s}s")
-    } else if s < 3600 {
-        format!("idle {}m", s / 60)
-    } else {
-        format!("idle {}h", s / 3600)
-    }
+    format!("idle {}", human(ms))
 }
 
 /// Rarity glyph color: legendary in the accent, rare bright, common dim.
@@ -1464,17 +1463,6 @@ fn overlay(line: &mut Line<'static>, col: usize, ch: char, c: Color) {
     line.spans = spans;
 }
 
-/// "45s", "2m05s", "1h02m"
-fn dur(secs: i64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m{:02}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h{:02}m", secs / 3600, (secs / 60) % 60)
-    }
-}
-
 /// `l`: lifetime totals across sessions (needs persistence), then a line per
 /// harness (up to 3, or fewer to keep `h` lines).
 fn lifetime_panel(view: &View, w: i64, h: usize) -> Vec<Line<'static>> {
@@ -1503,7 +1491,7 @@ fn lifetime_panel(view: &View, w: i64, h: usize) -> Vec<Line<'static>> {
         "cache",
         if view.cost { format!("saved {}", fmt_cost(lt.cache_saved)) } else { "·".into() },
         "fastest",
-        lt.fastest_ms.map_or("·".into(), |ms| format!("{:.1}s", ms as f64 / 1000.0)),
+        lt.fastest_ms.map_or("·".into(), compact),
     ));
     // per harness: room for what the achievements (3 lines) leave
     let rows = h.saturating_sub(out.len() + 3).min(3);
@@ -1565,7 +1553,7 @@ fn popup_line(sess: &Session, t: i64, app_t: i64, calm: bool) -> Line<'static> {
 
 fn footer_line() -> Line<'static> {
     let mut v = vec![sp(" ", D)];
-    let hints = [("v", "view"), ("s", "stats"), ("t", "timeline"), ("l", "lifetime"), ("?", "help")];
+    let hints = [("v", "view"), ("s", "stats"), ("t", "timeline"), ("l", "lifetime"), ("i", "inbox"), ("?", "help")];
     for (i, (k, what)) in hints.iter().enumerate() {
         if i > 0 {
             v.push(sp(" · ", VD));
@@ -1870,8 +1858,53 @@ mod tests {
     }
 
     /// The stuck fix: a running agent silent for 2m+ with a tool call still in
-    /// flight reads "running 2m" with an awake face and no z's; only with
+    /// flight reads "busy 2m 30s" with an awake face and no z's; only with
     /// nothing in flight does it doze.
+    #[test]
+    fn solo_root_waits_on_its_agent_and_the_spinner_never_touches_the_time() {
+        let agent = |finish: Option<i64>| Agent {
+            name: "claude".into(),
+            spawn: 0,
+            finish,
+            tools: vec![Tool::run("cargo")],
+            live_tool: Some(0),
+            last_seen: Some(2_673_000),
+            ..Agent::default()
+        };
+        let solo = |finish: Option<i64>| Session {
+            header: "agentflow // claude // app".into(),
+            agents: vec![agent(finish)],
+            all: finish.map_or(i64::MAX, |f| f + 500),
+            live: true,
+            solo: true,
+            harness: Some(crate::schema::Harness::Claude),
+            ..Session::default()
+        };
+        let mut rng = rand::thread_rng();
+        let v = View { stuck_ms: 120_000, panel: Panel::Main, base: Panel::Main, ..View::default() };
+        let t = 2_673_000; // 44m 33s in
+        let txt = text(&frame(&solo(None), t, 5_000, &v, &mut rng));
+        let root = txt.lines().find(|l| l.contains("◆ you")).unwrap();
+        assert!(root.contains("waiting on claude") && !root.contains("delegating"), "{root}");
+        let row = txt.lines().find(|l| l.contains("44m 33s")).unwrap_or_else(|| panic!("{txt}"));
+        let before = row.chars().nth(row.chars().position(|c| c == '4').unwrap() - 1);
+        assert_eq!(before, Some(' '), "a space between the spinner and the time: {row}");
+        assert!(SPIN.iter().any(|s| row.contains(&format!("{s} 44m 33s"))), "{row}");
+
+        let txt = text(&frame(&solo(Some(10_000)), 20_000, 5_000, &v, &mut rng));
+        let root = txt.lines().find(|l| l.contains("◆ you")).unwrap();
+        assert!(root.contains("all done ✓"), "{root}");
+
+        // the orbit's center says the same
+        let o = View { panel: Panel::Orbit, base: Panel::Orbit, ..v };
+        assert!(text(&frame(&solo(None), t, 5_000, &o, &mut rng)).contains("waiting on claude"));
+
+        // a real multi-agent session still delegates
+        let demo = crate::demo::session("h".into(), &crate::pricing::Pricing::default());
+        let txt = text(&frame(&demo, 2_000, 5_000, &v, &mut rng));
+        assert!(txt.lines().find(|l| l.contains("◆ orchestrator")).unwrap().contains("delegating"), "{txt}");
+    }
+
     #[test]
     fn in_flight_tool_call_runs_instead_of_dozing() {
         let mut s = crate::demo::synth("h".into());
@@ -1885,7 +1918,7 @@ mod tests {
         for panel in [Panel::Main, Panel::Orbit, Panel::Detail] {
             let v = View { calm: false, stuck_ms: 120_000, panel, base: panel, selected: Some(0), ..View::default() };
             let txt = text(&frame(&s, t, t, &v, &mut rng));
-            assert!(txt.contains("running 2m"), "{panel:?}: {txt}");
+            assert!(txt.contains("busy 2m 30s"), "{panel:?}: {txt}");
             assert!(!txt.contains("(-_-)") && !txt.contains("idle") && !txt.contains('z'), "{panel:?}: {txt}");
         }
         // the slow spinner: steps every 400ms, not every 80ms
@@ -1922,7 +1955,9 @@ mod tests {
         let t = 14_000 * 400;
         let lines = frame(&s, t, t, &narrow, &mut rng);
         let team = lines.iter().map(|l| text(std::slice::from_ref(l))).find(|l| l.contains("team")).unwrap();
-        assert!(team.trim_end().chars().count() as i64 <= width(&narrow) && !team.contains("of work"), "{team}");
+        assert!(team.trim_end().chars().count() as i64 <= width(&narrow), "{team}");
+        let tail = work_in_wall(&stats::parallelism(&s.agents, t), s.scale());
+        assert!(team.contains(&tail) || !team.contains("of work"), "whole or not at all: {team}");
     }
 
     fn mixed_demo() -> Session {

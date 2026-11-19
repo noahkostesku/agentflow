@@ -35,6 +35,71 @@ pub struct Config {
     pub validators: Vec<String>,
     /// USD per million tokens, keyed by model id or family
     pub pricing: HashMap<String, RatesOverride>,
+    /// `agentflow inbox`
+    pub inbox: InboxConfig,
+    /// desktop notifications (`agentflow notify`, `inbox --notify`)
+    pub notify: NotifyConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InboxConfig {
+    /// a session counts as active (shows in the inbox) if it was written to
+    /// within this many minutes
+    pub active_minutes: u64,
+}
+
+impl Default for InboxConfig {
+    fn default() -> Self {
+        InboxConfig { active_minutes: 30 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotifyConfig {
+    /// notify when a session starts waiting on you (a prompt, a question)
+    pub waiting: bool,
+    /// … when it hits an error (a denied or rejected tool call)
+    pub error: bool,
+    /// … when it goes quiet with nothing in flight
+    pub stuck: bool,
+    /// … when it finishes (its turn is over)
+    pub done: bool,
+    /// "22:00-08:00": no notifications in this local-time window (may span
+    /// midnight). Empty = none.
+    pub quiet: String,
+    /// seconds before the same state may notify again for the same session
+    /// (a slow command can flip working ↔ waiting); 0 = no guard
+    pub repeat_after: u64,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        NotifyConfig { waiting: true, error: true, stuck: true, done: true, quiet: String::new(), repeat_after: 300 }
+    }
+}
+
+impl NotifyConfig {
+    /// Is local minute-of-day `min` (0..1440) inside the quiet window?
+    pub fn is_quiet(&self, min: u32) -> bool {
+        match parse_quiet(&self.quiet) {
+            Some((a, b)) if a <= b => (a..b).contains(&min),
+            Some((a, b)) => min >= a || min < b,
+            None => false,
+        }
+    }
+}
+
+/// "22:00-08:00" → (1320, 480) in minutes of the day.
+pub fn parse_quiet(s: &str) -> Option<(u32, u32)> {
+    let hm = |t: &str| -> Option<u32> {
+        let (h, m) = t.trim().split_once(':')?;
+        let (h, m) = (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?);
+        (h < 24 && m < 60).then_some(h * 60 + m)
+    };
+    let (a, b) = s.split_once('-')?;
+    Some((hm(a)?, hm(b)?))
 }
 
 impl Default for Config {
@@ -49,6 +114,8 @@ impl Default for Config {
             stuck_after: (crate::stats::STUCK_MS / 1000) as u64,
             validators: Vec::new(),
             pricing: HashMap::new(),
+            inbox: InboxConfig::default(),
+            notify: NotifyConfig::default(),
         }
     }
 }
@@ -67,6 +134,20 @@ pub const DEFAULT_FILE: &str = r##"# agentflow config. Uncomment a line to chang
 # accent = "#c4a5b4"    # the one accent color (dusty mauve)
 # stuck_after = 120     # seconds of silence before an agent reads "idle" (0 = off)
 # validators = ["test-runner", "reviewer"]  # optional: label these roles pass/fail in orbit
+
+# The inbox (`agentflow inbox`, or `i`): every active session, any project.
+# [inbox]
+# active_minutes = 30   # a session written to this recently counts as active
+
+# Desktop notifications (`agentflow notify`, `agentflow inbox --notify`): one
+# per state change per session.
+# [notify]
+# waiting = true        # it's waiting on you (permission prompt, question)
+# error = true          # a tool call was denied or rejected
+# stuck = true          # quiet with nothing in flight (see stuck_after)
+# done = true           # it finished its turn
+# quiet = "22:00-08:00" # no notifications in this local-time window
+# repeat_after = 300    # seconds before the same state re-notifies a session
 
 # Pricing overrides, USD per million tokens. Key by family (opus, sonnet,
 # haiku, fable) or exact model id. Unset fields keep the built-in rate (see
@@ -94,6 +175,9 @@ impl Config {
         let cfg: Config = toml::from_str(text).map_err(|e| e.message().to_string())?;
         if parse_hex(&cfg.accent).is_none() {
             return Err(format!("accent \"{}\" is not a #rrggbb color", cfg.accent));
+        }
+        if !cfg.notify.quiet.trim().is_empty() && parse_quiet(&cfg.notify.quiet).is_none() {
+            return Err(format!("notify.quiet \"{}\" is not a \"HH:MM-HH:MM\" window", cfg.notify.quiet));
         }
         Ok(cfg)
     }
@@ -200,6 +284,35 @@ mod tests {
         assert!(Config::parse("costs = true").is_err(), "typos are reported");
         assert!(Config::parse("stuck_after = -5").is_err());
         assert!(Config::parse("[pricing.opus]\ninptu = 1.0").is_err());
+    }
+
+    #[test]
+    fn inbox_and_notify_sections() {
+        let d = Config::default();
+        assert_eq!(d.inbox.active_minutes, 30);
+        assert!(d.notify.waiting && d.notify.error && d.notify.stuck && d.notify.done);
+        assert!(d.notify.quiet.is_empty() && !d.notify.is_quiet(0));
+        let cfg = Config::parse(
+            r#"
+            [inbox]
+            active_minutes = 90
+            [notify]
+            done = false
+            quiet = "22:30-07:00"
+            repeat_after = 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.inbox.active_minutes, 90);
+        assert!(!cfg.notify.done && cfg.notify.waiting, "unset toggles stay on");
+        assert_eq!(cfg.notify.repeat_after, 0);
+        assert!(cfg.notify.is_quiet(23 * 60) && cfg.notify.is_quiet(6 * 60 + 59));
+        assert!(!cfg.notify.is_quiet(7 * 60) && !cfg.notify.is_quiet(22 * 60 + 29));
+        let day = NotifyConfig { quiet: "12:00-13:00".into(), ..NotifyConfig::default() };
+        assert!(day.is_quiet(12 * 60 + 30) && !day.is_quiet(13 * 60));
+        assert!(Config::parse("[notify]\nquiet = \"late\"").is_err());
+        assert!(Config::parse("[notify]\nquiet = \"25:00-07:00\"").is_err());
+        assert!(Config::parse("[notify]\nsounds = true").is_err(), "typos are reported");
     }
 
     #[test]

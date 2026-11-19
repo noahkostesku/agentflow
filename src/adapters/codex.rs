@@ -18,7 +18,10 @@
 //!   * `token_usage_record`: one per model response (`response_id`), with
 //!     `input_tokens` (cached included), `cached_input_tokens`,
 //!     `cache_write_input_tokens` and `output_tokens` (reasoning included).
-//!   * `event_msg/task_complete` ends a turn with `last_agent_message`.
+//!   * `event_msg/task_complete` ends a turn with `last_agent_message`;
+//!     `event_msg/turn_aborted` (`reason: "interrupted"`) ends one early.
+//!   * A `request_user_input` function call asks the user a question: the
+//!     agent is waiting on them until its output comes back.
 //!
 //! Subagents (`collaboration.spawn_agent`) each get their own rollout in the
 //! same folder. Its `session_meta` names `parent_thread_id`, `agent_path`
@@ -63,6 +66,8 @@ struct Thread {
     skip_below: i64,
     /// latest model id
     model: Option<String>,
+    /// the turn's approval policy and sandbox
+    policy: Policy,
     /// call ids already seen
     seen: HashSet<String>,
     /// started, not yet finished: (event call id, the exec call id, op)
@@ -246,6 +251,7 @@ impl Thread {
             offset: 0,
             skip_below,
             model: None,
+            policy: Policy::default(),
             seen: HashSet::new(),
             open: Vec::new(),
         }
@@ -298,6 +304,12 @@ impl Thread {
             ("turn_context", _) => {
                 if let Some(m) = str_at(p, "/model") {
                     self.model = Some(m);
+                }
+                if let Some(a) = str_at(p, "/approval_policy") {
+                    self.policy.approval = Some(a);
+                }
+                if let Some(s) = str_at(p, "/sandbox_policy/type") {
+                    self.policy.sandbox = Some(s);
                 }
             }
             ("event_msg", "thread_settings_applied") => {
@@ -354,6 +366,14 @@ impl Thread {
                     },
                 ));
             }
+            ("event_msg", "turn_aborted") => {
+                // the user interrupted the turn (`reason: "interrupted"`): it's
+                // over, and whatever was open went with it
+                for (id, _, _) in std::mem::take(&mut self.open) {
+                    out.push(self.finished(ts, &id, false));
+                }
+                out.push(self.ev(ts, Body::AgentFinished { agent: MAIN.into(), result: None, bytes: None, error: false }));
+            }
             ("event_msg", "task_complete") => {
                 // the turn is over: anything still open ended with it
                 for (id, _, _) in std::mem::take(&mut self.open) {
@@ -386,7 +406,7 @@ impl Thread {
         let name = p.get("name").and_then(Value::as_str).unwrap_or("tool");
         let ops: Vec<(Body, Op)> = if name == "exec" {
             let input = p.get("input").and_then(Value::as_str).unwrap_or("");
-            script_ops(input)
+            script_ops(input, &self.policy)
         } else {
             vec![(tool_body(name, name, ToolKind::Run, ""), Op::Other)]
         };
@@ -410,6 +430,12 @@ impl Thread {
             }
             out.push(self.ev(ts, body));
             self.open.push((id, call.to_string(), op));
+        }
+        // A question for the user: blocked on them until it returns. (The tool
+        // is offered in 0.170.0's tool list; a call to it is not yet observed.)
+        if name.ends_with("request_user_input") {
+            let body = Body::Waiting { agent: MAIN.into(), call: Some(call.to_string()), reason: "question".into() };
+            out.push(self.ev(ts, body));
         }
     }
 
@@ -478,7 +504,7 @@ impl Thread {
 /// The tools an `exec` script calls, in order. Polls of a running command
 /// (`write_stdin`) aren't new tools; a script calling nothing we know is one
 /// generic `exec` call.
-fn script_ops(js: &str) -> Vec<(Body, Op)> {
+fn script_ops(js: &str, policy: &Policy) -> Vec<(Body, Op)> {
     let mut ops = Vec::new();
     let mut patched = false;
     let mut rest = js;
@@ -486,10 +512,17 @@ fn script_ops(js: &str) -> Vec<(Body, Op)> {
         rest = &rest[i + 6..];
         let fname: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
         let args = &rest[fname.len()..];
+        // this call's own arguments: up to the next tool call
+        let own = &args[..args.find("tools.").unwrap_or(args.len())];
         match fname.as_str() {
             "exec_command" => {
                 let cmd = js_string_field(args, "cmd").unwrap_or_default();
-                ops.push((command_body(&cmd), Op::Cmd(cmd)));
+                let escalated = js_string_field(own, "sandbox_permissions").as_deref() == Some("require_escalated");
+                let mut body = command_body(&cmd);
+                if let Body::ToolStarted { blocking, .. } = &mut body {
+                    *blocking = *blocking && policy.asks(escalated, false);
+                }
+                ops.push((body, Op::Cmd(cmd)));
             }
             "apply_patch" if !patched => {
                 // the patch text is usually a `const` earlier in the script,
@@ -507,7 +540,7 @@ fn script_ops(js: &str) -> Vec<(Body, Op)> {
                         file: Some(file.clone()),
                         edit: true,
                         arg: name,
-                        blocking: true,
+                        blocking: policy.asks(false, true),
                         test: false,
                     };
                     ops.push((body, Op::Patch(file)));
@@ -521,6 +554,31 @@ fn script_ops(js: &str) -> Vec<(Body, Op)> {
         ops.push((tool_body("exec", "exec", ToolKind::Run, ""), Op::Other));
     }
     ops
+}
+
+/// When Codex asks before running something, from the turn's
+/// `approval_policy` and `sandbox_policy` (`turn_context`).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Policy {
+    /// "on-request", "never", "untrusted", "on-failure"
+    approval: Option<String>,
+    /// "workspace-write", "read-only", "danger-full-access"
+    sandbox: Option<String>,
+}
+
+impl Policy {
+    /// Can a call sit at an approval prompt? `never` never asks.
+    /// `on-request` runs commands in the sandbox unasked unless they request
+    /// `sandbox_permissions: "require_escalated"`, and asks before a patch
+    /// only in a read-only sandbox. Anything else (or not recorded): any can.
+    fn asks(&self, escalated: bool, patch: bool) -> bool {
+        match self.approval.as_deref() {
+            Some("never") => false,
+            Some("on-request") if patch => self.sandbox.as_deref() == Some("read-only"),
+            Some("on-request") => escalated,
+            _ => true,
+        }
+    }
 }
 
 fn tool_body(tool: &str, label: &str, kind: ToolKind, arg: &str) -> Body {
@@ -767,6 +825,57 @@ pub fn find(root: &Path, id: Option<&str>, project: Option<&Path>, fallback: boo
     }
 }
 
+/// Every top-level session, in any project, that showed signs of life at or
+/// after `since` (its own rollout or a subagent's), with that activity. A
+/// subagent's write makes its top-level session active even when the
+/// session's own rollout is older.
+pub fn active(root: &Path, since: SystemTime) -> Vec<(PathBuf, SystemTime)> {
+    let all = rollouts(root);
+    let by_id: HashMap<String, &PathBuf> = all.iter().map(|(p, _)| (session_id_of(p), p)).collect();
+    let mut parent_of: HashMap<String, String> = HashMap::new();
+    let mut fresh: Vec<(PathBuf, SystemTime)> = all.iter().filter(|(_, m)| *m >= since).cloned().collect();
+    // parents before children, so a chain resolves in one pass
+    fresh.sort_by_key(|(_, m)| *m);
+    let mut tops: HashMap<String, SystemTime> = HashMap::new();
+    for (p, m) in &fresh {
+        let Some(meta) = head(p) else {
+            continue;
+        };
+        let top = match child_of(&meta) {
+            Some(c) => {
+                parent_of.insert(c.id, c.parent.clone());
+                let mut top = c.parent;
+                // a parent we haven't read yet: its header names its own parent
+                let mut hops = 0;
+                loop {
+                    if let Some(up) = parent_of.get(&top) {
+                        top = up.clone();
+                    } else if let Some(c) = by_id.get(&top).and_then(|pp| head(pp)).as_ref().and_then(child_of) {
+                        parent_of.insert(c.id, c.parent.clone());
+                        top = c.parent;
+                    } else {
+                        break;
+                    }
+                    hops += 1;
+                    if hops > 16 {
+                        break;
+                    }
+                }
+                top
+            }
+            None => session_id_of(p),
+        };
+        let e = tops.entry(top).or_insert(*m);
+        *e = (*e).max(*m);
+    }
+    tops.into_iter().filter_map(|(id, m)| by_id.get(&id).map(|p| ((*p).clone(), m))).collect()
+}
+
+/// The `cwd` a rollout's `session_meta` names.
+pub fn read_cwd(path: &Path) -> Option<PathBuf> {
+    head(path)?.pointer("/payload/cwd").and_then(Value::as_str).map(PathBuf::from)
+}
+
 /// When a session last showed signs of life: its rollout or any of its
 /// subagents' (at any depth).
 pub fn activity(root: &Path, path: &Path) -> SystemTime {
@@ -877,6 +986,63 @@ mod tests {
         let want = (1000.0 * 0.10 + 100.0 * 0.50 + 200.0 * 0.10 + 1000.0 * 0.01 + 50.0 * 0.50) / 1e6;
         assert!((s.cost_at(i64::MAX) - want).abs() < 1e-12);
         assert!(s.unpriced.is_empty());
+    }
+
+    /// A question for the user waits on them until its output lands; an
+    /// interrupted turn (`turn_aborted`) is over, its open command with it.
+    #[test]
+    fn questions_and_interrupted_turns() {
+        let dir = std::env::temp_dir().join(format!("aflow-codex-abort-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-01-01T00-00-00-0000ffff-1111-2222-3333-444455556666.jsonl");
+        let lines = [
+            r#"{"timestamp":"2026-01-01T00:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"0000ffff-1111-2222-3333-444455556666","cwd":"/w/proj"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:01.000Z","ordinal":1,"type":"response_item","payload":{"type":"function_call","call_id":"u1","name":"request_user_input","arguments":"{}"}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let mut live = Live::new(Box::new(CodexAdapter::open(&path)) as Box<dyn SourceAdapter>, "h".into());
+        live.refresh();
+        let now = iso_to_ms("2026-01-01T00:05:00.000Z").unwrap();
+        let p = live.pulse(&Pricing::default(), now);
+        assert_eq!(p.waiting, Some((iso_to_ms("2026-01-01T00:00:01.000Z").unwrap(), "question".into())));
+
+        let more = [
+            r#"{"timestamp":"2026-01-01T00:00:30.000Z","ordinal":2,"type":"response_item","payload":{"type":"function_call_output","call_id":"u1","output":"staging"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:31.000Z","ordinal":3,"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c1","name":"exec","input":"const r = await tools.exec_command({cmd:\"cargo build\"});"}}"#,
+            r#"{"timestamp":"2026-01-01T00:00:40.000Z","ordinal":4,"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#,
+        ];
+        std::fs::write(&path, std::fs::read_to_string(&path).unwrap() + &more.join("\n") + "\n").unwrap();
+        live.refresh();
+        let p = live.pulse(&Pricing::default(), now);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(p.waiting, None);
+        assert!(!p.running && !p.in_flight, "the turn is over and nothing is left open");
+        assert_eq!(p.done, Some(iso_to_ms("2026-01-01T00:00:40.000Z").unwrap()));
+    }
+
+    /// `on-request` (the default) runs sandboxed commands unasked: only one
+    /// that requests escalation can sit at a prompt, and a patch only in a
+    /// read-only sandbox. `never` never asks; `untrusted` can ask for any.
+    #[test]
+    fn approval_policy_decides_what_can_wait() {
+        let blocking = |js: &str, approval: &str, sandbox: &str| -> Vec<bool> {
+            let policy = Policy { approval: Some(approval.into()), sandbox: Some(sandbox.into()) };
+            script_ops(js, &policy)
+                .into_iter()
+                .filter_map(|(b, _)| match b {
+                    Body::ToolStarted { blocking, .. } => Some(blocking),
+                    _ => None,
+                })
+                .collect()
+        };
+        let js = r#"await tools.exec_command({cmd:"cargo build"}); await tools.exec_command({cmd:"git push", sandbox_permissions:"require_escalated", justification:"push"});"#;
+        assert_eq!(blocking(js, "on-request", "workspace-write"), [false, true]);
+        assert_eq!(blocking(js, "never", "workspace-write"), [false, false]);
+        assert_eq!(blocking(js, "untrusted", "workspace-write"), [true, true]);
+        let patch = "const p = `*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n*** End Patch`;\nawait tools.apply_patch(p);";
+        assert_eq!(blocking(patch, "on-request", "workspace-write"), [false]);
+        assert_eq!(blocking(patch, "on-request", "read-only"), [true]);
+        assert!(Policy::default().asks(false, false), "not recorded: any call can ask");
     }
 
     #[test]

@@ -47,10 +47,21 @@ struct Acc {
     error_ts: Option<i64>,
     size: String,
     tools: Vec<(i64, Tool)>,
-    /// outstanding tool calls with no result yet: (call id, ts, blocking)
-    pending: Vec<(String, i64, bool)>,
+    /// outstanding tool calls with no result yet
+    pending: Vec<Pending>,
     /// an explicit `waiting` event's time, until its next tool or finish
     waiting: Option<i64>,
+    /// what it's waiting on ("question: which db?"), with `waiting`
+    wait_what: String,
+    /// what its latest error was about ("denied $ rm -rf build")
+    error_what: String,
+    /// when its current turn of work began (its first record, or `main`'s
+    /// first tool call after a finish)
+    turn_ts: Option<i64>,
+    /// the latest tool call it made, described
+    doing: String,
+    /// the latest tool call that returned, described
+    last_call: String,
     order: usize,
     /// latest model id seen
     model: String,
@@ -69,6 +80,19 @@ struct Acc {
 
 /// call id -> (first seen ms, usage, model)
 type Calls = HashMap<String, (i64, Usage, String)>;
+
+/// A tool call with no result yet.
+struct Pending {
+    id: String,
+    /// when it started (epoch ms)
+    ts: i64,
+    /// it can block on an approval prompt
+    blocking: bool,
+    /// what it is: "$ cargo test", "edit lib.rs"
+    what: String,
+    /// its argument alone ("which database?" for a question)
+    arg: String,
+}
 
 pub struct Live {
     src: Box<dyn SourceAdapter>,
@@ -143,6 +167,7 @@ impl Live {
         // or finish may be reported by its parent, so those don't count.
         if !matches!(ev.body, Body::AgentSpawned { .. } | Body::AgentFinished { .. }) {
             acc.first_ts.get_or_insert(ts);
+            acc.turn_ts.get_or_insert(ts);
             acc.last_ts = Some(acc.last_ts.map_or(ts, |l| l.max(ts)));
         }
         match &ev.body {
@@ -176,16 +201,26 @@ impl Live {
                 // don't reopen: their own records can arrive after a finish
                 // their parent reported.)
                 if is_main {
+                    if acc.finished {
+                        acc.turn_ts = Some(ts);
+                    }
                     acc.finished = false;
                     acc.done_ts = None;
                 }
+                acc.doing = describe(tool, arg);
                 let kind = match kind {
                     schema::ToolKind::Look => ToolKind::Look,
                     schema::ToolKind::Run => ToolKind::Run,
                 };
                 acc.tools.push((ts, Tool { name: label.clone(), kind }));
                 if let Some(id) = call {
-                    acc.pending.push((id.clone(), ts, *blocking));
+                    acc.pending.push(Pending {
+                        id: id.clone(),
+                        ts,
+                        blocking: *blocking,
+                        what: describe(tool, arg),
+                        arg: arg.clone(),
+                    });
                     if *test {
                         acc.test_ids.insert(id.clone());
                     }
@@ -195,7 +230,13 @@ impl Live {
             Body::ToolFinished { call, error, denied, .. } => {
                 acc.waiting = None;
                 if let Some(id) = call {
-                    acc.pending.retain(|(pid, _, _)| pid != id);
+                    if let Some(p) = acc.pending.iter().find(|p| &p.id == id) {
+                        acc.last_call = p.what.clone();
+                    }
+                    if *denied {
+                        acc.error_what = format!("denied {}", acc.last_call).trim_end().to_string();
+                    }
+                    acc.pending.retain(|p| &p.id != id);
                     if acc.test_ids.remove(id) && !denied {
                         acc.tests.push(TestRun { time: noticed(ts), passed: !error });
                     }
@@ -224,8 +265,16 @@ impl Live {
             }
             Body::Output { text, .. } => acc.last_text.clone_from(text),
             Body::Handoff { to, bytes, .. } => acc.messages.push((noticed(ts), to.clone(), *bytes)),
-            Body::Waiting { .. } => {
+            Body::Waiting { call, reason, .. } => {
                 acc.waiting.get_or_insert(ts);
+                // "question: which database?", or the call itself
+                let on = call.as_ref().and_then(|c| acc.pending.iter().find(|p| &p.id == c));
+                acc.wait_what = match (reason.as_str(), on) {
+                    ("", Some(p)) => p.what.clone(),
+                    ("", None) => String::new(),
+                    (r, Some(p)) if !p.arg.trim().is_empty() => format!("{r}: {}", p.arg.trim()),
+                    (r, _) => r.to_string(),
+                };
             }
             Body::AgentFinished { result, bytes, error, .. } => {
                 acc.finished = true;
@@ -243,9 +292,10 @@ impl Live {
                     acc.error_ts = Some(noticed(ts));
                 }
             }
-            Body::AgentError { .. } => {
+            Body::AgentError { message, .. } => {
                 acc.denied = true;
                 acc.error_ts = Some(noticed(ts));
+                acc.error_what = format!("{message} {}", acc.last_call).trim().to_string();
             }
             Body::Heartbeat { .. } => {}
         }
@@ -305,8 +355,8 @@ impl Live {
             let inferred = a
                 .pending
                 .iter()
-                .filter(|(_, _, can)| *can)
-                .map(|(_, ts, _)| *ts)
+                .filter(|p| p.blocking)
+                .map(|p| p.ts)
                 .min()
                 .filter(|pts| now - *pts > WAIT_MS)
                 .map(|pts| pts + WAIT_MS);
@@ -393,7 +443,7 @@ impl Live {
                 in_flight: if a.finished {
                     None
                 } else {
-                    a.pending.iter().map(|(_, ts, _)| *ts).min().map(|ts| ts - t0)
+                    a.pending.iter().map(|p| p.ts).min().map(|ts| ts - t0)
                 },
                 prompt: a.prompt.clone(),
                 tag: a.tag.clone(),
@@ -500,6 +550,140 @@ impl Live {
     /// When we started watching (epoch ms).
     pub fn opened(&self) -> i64 {
         self.opened
+    }
+
+    /// The session id, once `session_started` named it.
+    pub fn session_id(&self) -> &str {
+        self.session.as_deref().unwrap_or_else(|| self.src.session_id())
+    }
+
+    /// The whole session at a glance as of epoch ms `now`, for the inbox:
+    /// is anyone waiting on the user, in error, running; what it's doing.
+    /// Every agent counts, the orchestrator included.
+    pub fn pulse(&self, pricing: &Pricing, now: i64) -> Pulse {
+        let orchestrated = self.orchestrated();
+        let mut p = Pulse { empty: self.accs.is_empty(), ..Pulse::default() };
+        // the latest tool call of any running agent: (ts, who, what)
+        let mut doing: Option<(i64, &str, &Acc)> = None;
+        for (key, a) in &self.accs {
+            let sub = key != MAIN;
+            if sub || !orchestrated {
+                p.total += 1;
+                p.active += usize::from(!a.finished);
+            }
+            let start = a.spawn_ms.or(a.first_ts);
+            p.started = match (p.started, start) {
+                (Some(x), Some(y)) => Some(x.min(y)),
+                (x, y) => x.or(y),
+            };
+            let seen = [a.last_ts, a.spawn_ms, a.done_ts].into_iter().flatten().max();
+            p.last = p.last.max(seen.unwrap_or(0));
+            for (_, usage, model) in a.usage.values() {
+                p.cost += pricing.cost(model, usage);
+                p.unpriced |= !model.is_empty() && pricing.rates(model).is_none();
+            }
+            if a.finished {
+                p.done = Some(p.done.unwrap_or(0).max(a.done_ts.or(a.last_ts).unwrap_or(0)));
+                // the orchestrator ending its turn with an error stays one
+                if a.denied && !sub {
+                    p.error = Some((a.error_ts.unwrap_or(0), a.error_what.clone()));
+                }
+                continue;
+            }
+            p.running = true;
+            p.in_flight |= !a.pending.is_empty();
+            p.turn = Some(p.turn.unwrap_or(i64::MAX).min(a.turn_ts.or(start).unwrap_or(now)));
+            if a.denied {
+                let e = (a.error_ts.unwrap_or(0), a.error_what.clone());
+                if p.error.as_ref().is_none_or(|old| e.0 < old.0) {
+                    p.error = Some(e);
+                }
+                continue;
+            }
+            // waiting: an explicit prompt, or a call that can prompt and
+            // hasn't returned for a while (could be a slow command)
+            let inferred = a.pending.iter().filter(|c| c.blocking && now - c.ts > WAIT_MS).min_by_key(|c| c.ts);
+            let wait = match (a.waiting, inferred) {
+                (Some(ts), _) => Some((ts, a.wait_what.clone())),
+                (None, Some(c)) => Some((c.ts, c.what.clone())),
+                (None, None) => None,
+            };
+            if let Some(w) = wait {
+                let who = if orchestrated && sub { format!("{}: ", self.role_of(key, a)) } else { String::new() };
+                let w = (w.0, format!("{who}{}", w.1).trim_end_matches(": ").to_string());
+                if p.waiting.as_ref().is_none_or(|old| w.0 < old.0) {
+                    p.waiting = Some(w);
+                }
+            }
+            if let Some(&(ts, _)) = a.tools.last() {
+                if doing.is_none_or(|(t, _, _)| ts > t) {
+                    doing = Some((ts, key, a));
+                }
+            }
+        }
+        if p.running {
+            p.done = None;
+        }
+        p.doing = doing
+            .map(|(_, key, a)| {
+                let who = if orchestrated && key != MAIN { format!("{}: ", self.role_of(key, a)) } else { String::new() };
+                format!("{who}{}", a.doing)
+            })
+            .unwrap_or_default();
+        // what it said last: the orchestrator's (or only agent's) answer
+        let main = self.accs.get(MAIN);
+        p.said = main
+            .and_then(|m| m.result.clone().filter(|r| !r.trim().is_empty()).or_else(|| Some(m.last_text.clone())))
+            .unwrap_or_default();
+        p
+    }
+
+    /// A subagent's display name for the inbox's "who: what".
+    fn role_of(&self, key: &str, a: &Acc) -> String {
+        [&a.role, &a.agent_type].into_iter().find(|s| !s.is_empty()).cloned().unwrap_or_else(|| key.chars().take(8).collect())
+    }
+}
+
+/// One session at a glance (see [`Live::pulse`]). Times are epoch ms.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Pulse {
+    /// nothing has happened in it yet
+    pub empty: bool,
+    /// some agent is blocked on the user: since when, and on what
+    pub waiting: Option<(i64, String)>,
+    /// some agent's latest outcome was an error (a denial, a rejection)
+    pub error: Option<(i64, String)>,
+    /// some agent hasn't finished
+    pub running: bool,
+    /// some running agent has a tool call that hasn't returned
+    pub in_flight: bool,
+    /// latest sign of life from any agent
+    pub last: i64,
+    /// every agent finished: when the last one did
+    pub done: Option<i64>,
+    /// when the work now running began (the current turn)
+    pub turn: Option<i64>,
+    /// earliest agent start
+    pub started: Option<i64>,
+    /// the latest tool call of a running agent ("scout: read lib.rs")
+    pub doing: String,
+    /// the orchestrator's (or only agent's) latest message
+    pub said: String,
+    /// working rows still running / all rows (subagents, or the one agent)
+    pub active: usize,
+    pub total: usize,
+    /// API-equivalent USD so far
+    pub cost: f64,
+    /// some tokens came from a model with no known price
+    pub unpriced: bool,
+}
+
+/// A tool call in a few words: "$ cargo test -q", "edit lib.rs", "grep".
+fn describe(tool: &str, arg: &str) -> String {
+    match (tool, arg.trim()) {
+        (_, "") => tool.to_string(),
+        ("bash", a) => format!("$ {a}"),
+        (t, a) => format!("{t} {a}"),
     }
 }
 
@@ -676,6 +860,48 @@ mod tests {
             tool(200, "a", "c2"),
         ]);
         assert!(!s.agents[0].error, "cleared by its next tool call");
+    }
+
+    /// The inbox's view of a session: a subagent's call that can prompt and
+    /// hasn't returned for 10s is waiting, named for its agent; agents count
+    /// active/total; the orchestrator's denial is an error; a finished
+    /// session reports when.
+    #[test]
+    fn pulse_for_the_inbox() {
+        let mut live = Live::new(
+            Box::new(Script(vec![
+                ev(0, Body::SessionStarted { cwd: Some("/w".into()), subagents: true }),
+                tool(100, MAIN, "m1"),
+                ev(150, Body::ToolFinished { agent: MAIN.into(), call: Some("m1".into()), error: false, denied: false }),
+                spawn(200, "a", "scout"),
+                spawn(300, "b", "fixer"),
+                tool(400, "a", "c1"),
+                ev(500, Body::AgentFinished { agent: "b".into(), result: Some("ok".into()), bytes: None, error: false }),
+            ])) as Box<dyn SourceAdapter>,
+            "h".into(),
+        );
+        live.refresh();
+        let p = live.pulse(&Pricing::default(), 5_000);
+        assert_eq!((p.waiting.clone(), p.active, p.total), (None, 1, 2), "a 4.6s call isn't a wait yet");
+        assert_eq!(p.doing, "scout: $ make");
+        assert!(p.running && p.in_flight);
+        let p = live.pulse(&Pricing::default(), 20_000);
+        assert_eq!(p.waiting, Some((400, "scout: $ make".into())));
+
+        let mut live = Live::new(
+            Box::new(Script(vec![
+                tool(100, MAIN, "m1"),
+                ev(200, Body::ToolFinished { agent: MAIN.into(), call: Some("m1".into()), error: true, denied: true }),
+                ev(300, Body::AgentFinished { agent: MAIN.into(), result: Some("Blocked.\nby policy".into()), bytes: None, error: false }),
+            ])) as Box<dyn SourceAdapter>,
+            "h".into(),
+        );
+        live.refresh();
+        let p = live.pulse(&Pricing::default(), 5_000);
+        assert!(!p.running);
+        assert_eq!(p.error.map(|e| e.1).as_deref(), Some("denied $ make"));
+        assert_eq!(p.done, Some(300));
+        assert_eq!(p.said, "Blocked.\nby policy");
     }
 
     /// Without subagents `main` is the one row, named for the harness; it

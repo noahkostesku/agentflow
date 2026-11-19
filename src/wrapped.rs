@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
+use crate::duration::{compact, human};
 use crate::lifetime::{per_harness, HarnessTotals, Store};
 use crate::model::rarity;
 use crate::pricing::fmt_tokens;
@@ -239,17 +240,6 @@ pub fn demo(range: Range) -> Wrapped {
     }
 }
 
-/// "45s", "12m", "3h05m"
-pub fn hm(ms: i64) -> String {
-    let s = ms.max(0) / 1000;
-    if s < 60 {
-        format!("{s}s")
-    } else if s < 3600 {
-        format!("{}m", s / 60)
-    } else {
-        format!("{}h{:02}m", s / 3600, (s / 60) % 60)
-    }
-}
 
 // ---- animation helpers -----------------------------------------------------
 
@@ -402,7 +392,7 @@ fn slide_tools(w: &Wrapped, ms: i64) -> Vec<Line<'static>> {
         out.push(Line::from(vec![
             sp(format!("    {:<8}", h.harness), if i == 0 { ac() } else { B }),
             sp(format!("{sessions:<12}"), G),
-            sp(format!("{:>6} ", hm((h.work_ms as f64 * grow) as i64)), B),
+            sp(format!("{:>7} ", human((h.work_ms as f64 * grow) as i64)), B),
             sp(format!("{bar:<12}"), if i == 0 { ac() } else { dim(ac(), 0.6) }),
             sp(format!(" ≈{}", money(h.cost * grow)), G),
         ]));
@@ -520,18 +510,18 @@ fn slide_time(w: &Wrapped, ms: i64) -> Vec<Line<'static>> {
     let row = |label: &str, v: i64, delay: i64, c: Color| {
         Line::from(vec![
             sp(format!("    {label:<7}"), D),
-            sp(format!("{:>8}  ", hm((v as f64 * ease(ms, delay, 1000)) as i64)), B),
+            sp(format!("{:>8}  ", human((v as f64 * ease(ms, delay, 1000)) as i64)), B),
             sp(bar(v, delay), c),
         ])
     };
-    out.push(Line::from(sp(center(&hm(saved)), ac())));
+    out.push(Line::from(sp(center(&compact(saved)), ac())));
     out.push(Line::from(sp(center("of waiting"), B)));
     out.push(blank());
     out.push(row("work", w.work_ms, 900, ac()));
     out.push(row("wall", w.wall_ms, 1300, dim(ac(), 0.6)));
     out.push(blank());
     out.push(Line::from(sp(
-        center(&typed(&format!("{} of agent work in {}", hm(w.work_ms), hm(w.wall_ms)), ms, 2000)),
+        center(&typed(&format!("{} of agent work in {}", compact(w.work_ms), compact(w.wall_ms)), ms, 2000)),
         D,
     )));
     out
@@ -582,7 +572,7 @@ pub fn outro_rows(w: &Wrapped) -> Vec<Vec<(String, Color)>> {
     }
     let hour = peak_hour(w).map_or("·".into(), |h| format!("{h:02}:00"));
     let time_row: Vec<(String, Color)> = if w.wall_ms > 0 {
-        vec![("time saved   ".into(), D), (hm(w.time_saved_ms()), B), (" running in parallel".into(), D)]
+        vec![("time saved   ".into(), D), (compact(w.time_saved_ms()), B), (" running in parallel".into(), D)]
     } else {
         vec![("time saved   ".into(), D), ("·".into(), B)]
     };
@@ -832,19 +822,11 @@ mod tests {
         assert!(tools.contains("your tools"), "{tools}");
         let claude = tools.lines().find(|l| l.contains("claude")).unwrap();
         let codex = tools.lines().find(|l| l.contains("codex")).unwrap();
-        assert!(claude.contains("2 sessions") && claude.contains("2h30m") && claude.contains("≈$2.00"), "{claude}");
-        assert!(codex.contains("1 session ") && codex.contains("30m") && codex.contains("≈$1.00"), "{codex}");
+        assert!(claude.contains("2 sessions") && claude.contains("2h 30m") && claude.contains("≈$2.00"), "{claude}");
+        assert!(codex.contains("1 session ") && codex.contains("30m 00s") && codex.contains("≈$1.00"), "{codex}");
         assert!(claude.matches('⣿').count() > codex.matches('⣿').count(), "bars by agent time");
         assert!(txt(3).contains("codex · sol"), "{}", txt(3));
         assert!(txt(2).contains("your tools") && slide(&aggregate(&Store::default(), Range::Month, NOW), 2, 10_000).len() > 3);
-    }
-
-    #[test]
-    fn hm_formats() {
-        assert_eq!(hm(45_000), "45s");
-        assert_eq!(hm(12 * 60_000 + 59_000), "12m");
-        assert_eq!(hm((3 * 60 + 5) * 60_000), "3h05m");
-        assert_eq!(hm(-5), "0s");
     }
 
     #[test]

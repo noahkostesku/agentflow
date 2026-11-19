@@ -22,6 +22,7 @@ pub use crate::adapters::claude::{encode_path, projects_root};
 pub const SUPPORTED: &[Harness] = &[Harness::Claude, Harness::Codex];
 
 /// A session found to watch.
+#[derive(Clone, Debug)]
 pub struct Found {
     pub harness: Harness,
     /// its primary file
@@ -140,6 +141,30 @@ pub fn find_mixed_at(roots: &Roots, harnesses: &[Harness], project: &Path, now: 
         .map(|f| Found { fell_back: true, ..f })
         .collect();
     pick(anywhere)
+}
+
+/// Every session in any project and any of `harnesses` (in the given storage
+/// roots) that showed signs of life within `window` of `now`, subagents'
+/// writes included, newest first. For the inbox: what's running anywhere,
+/// not just here.
+pub fn find_active_at(roots: &Roots, harnesses: &[Harness], window: std::time::Duration, now: SystemTime) -> Vec<Found> {
+    let since = now.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut found: Vec<(SystemTime, Found)> = Vec::new();
+    for &h in harnesses {
+        let sessions = match h {
+            Harness::Claude => claude::active(&roots.claude, since),
+            Harness::Codex => codex::active(&roots.codex, since),
+        };
+        for (path, when) in sessions {
+            let project_dir = match h {
+                Harness::Claude => claude::read_cwd(&path),
+                Harness::Codex => codex::read_cwd(&path),
+            };
+            found.push((when, Found { harness: h, path, project_dir, fell_back: false }));
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
+    found.into_iter().map(|(_, f)| f).collect()
 }
 
 /// A session that has become newer than the one being watched, to switch

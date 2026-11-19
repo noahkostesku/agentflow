@@ -35,7 +35,7 @@ agentflow --demo     # looping scripted demo (no session needed)
 |------|---------|
 | `--demo` | replay the scripted demo session on a loop |
 | `--calm` | disable glitch, shimmer, and the finish wave (steady, low-motion) |
-| `--session <id>` | watch a specific session id |
+| `--session <id>` | watch a specific session id (pins it: no auto-switch) |
 | `--project <path>` | watch the session for another directory |
 
 **Controls:** `q` / `Esc` quit · `c` toggle calm · `space` pause (demo) · `r` restart (demo) / refresh now (live)
@@ -53,6 +53,11 @@ With no flags it picks, in order:
 2. otherwise the **most recently active session across all projects**, showing
    that project's name in the header.
 
+"Active" counts writes from background subagents too, so a session whose
+agents are still working isn't mistaken for idle. Every ~2s it re-scans, and if
+a newer session starts in the same directory it switches to it automatically
+(unless you pinned one with `--session`).
+
 It reads the main transcript for subagent spawns (so an agent appears the instant
 it's dispatched) and tails each subagent's own transcript for live tool activity,
 completion, and result size. Nothing is hardcoded to any one project.
@@ -64,7 +69,7 @@ The main session is the **orchestrator** (`◆`). Each subagent is named by role
 | spawn | role |
 |-------|------|
 | `Explore` | scout |
-| `general-purpose` | operator (→ researcher if the task looks web/research-y) |
+| `general-purpose` | the role from a `role: task` description (e.g. `test-runner: run cargo tests` → test-runner); otherwise operator, or researcher if the task looks web/research-y |
 | `Plan` | architect |
 | custom `subagent_type` | used as-is (reviewer, test-runner, fixer, …) |
 

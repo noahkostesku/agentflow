@@ -20,7 +20,6 @@ pub struct Resolved {
     /// absolute project directory this session belongs to (best effort)
     pub project_dir: Option<PathBuf>,
     /// true when we fell back to the global most-recent session
-    #[allow(dead_code)]
     pub fell_back: bool,
 }
 
@@ -38,7 +37,27 @@ pub fn encode_path(p: &Path) -> String {
         .collect()
 }
 
-/// Newest `.jsonl` file (by mtime) directly inside `dir`, if any.
+fn mtime(p: &Path) -> SystemTime {
+    fs::metadata(p)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// When a session last showed signs of life: the newest write to its main
+/// transcript *or* any of its subagent transcripts. Background agents keep
+/// writing to their own files while the main transcript sits quiet, so the
+/// main file's mtime alone would make a busy session look idle.
+pub fn activity(transcript: &Path) -> SystemTime {
+    let mut newest = mtime(transcript);
+    if let Ok(entries) = fs::read_dir(crate::transcript::subagents_dir(transcript)) {
+        for e in entries.flatten() {
+            newest = newest.max(e.metadata().and_then(|m| m.modified()).unwrap_or(newest));
+        }
+    }
+    newest
+}
+
+/// Most recently active `.jsonl` session directly inside `dir`, if any.
 fn newest_jsonl(dir: &Path) -> Option<(PathBuf, SystemTime)> {
     let mut best: Option<(PathBuf, SystemTime)> = None;
     for entry in fs::read_dir(dir).ok()?.flatten() {
@@ -46,12 +65,9 @@ fn newest_jsonl(dir: &Path) -> Option<(PathBuf, SystemTime)> {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        if best.as_ref().map_or(true, |(_, t)| mtime > *t) {
-            best = Some((path, mtime));
+        let when = activity(&path);
+        if best.as_ref().is_none_or(|(_, t)| when > *t) {
+            best = Some((path, when));
         }
     }
     best
@@ -105,9 +121,9 @@ pub fn resolve(
         if !dir.is_dir() {
             continue;
         }
-        if let Some((path, mtime)) = newest_jsonl(&dir) {
-            if best.as_ref().map_or(true, |(_, _, t)| mtime > *t) {
-                best = Some((path, dir, mtime));
+        if let Some((path, when)) = newest_jsonl(&dir) {
+            if best.as_ref().is_none_or(|(_, _, t)| when > *t) {
+                best = Some((path, dir, when));
             }
         }
     }

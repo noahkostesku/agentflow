@@ -18,6 +18,7 @@ pub fn session(header: String) -> Session {
             size: "2.1kb".into(),
             bob: 0,
             error: false,
+            error_at: None,
         },
         Agent {
             name: "researcher".into(),
@@ -33,6 +34,7 @@ pub fn session(header: String) -> Session {
             size: "4.8kb".into(),
             bob: 3,
             error: false,
+            error_at: None,
         },
         Agent {
             name: "test-runner".into(),
@@ -44,6 +46,7 @@ pub fn session(header: String) -> Session {
             size: "1.2kb".into(),
             bob: 6,
             error: false,
+            error_at: None,
         },
     ];
 
@@ -60,8 +63,8 @@ pub fn session(header: String) -> Session {
     }
 }
 
-/// A synthetic *live* session (debug): two active agents with unknown finish
-/// plus one that just finished, to exercise the live-only render branches.
+/// A synthetic *live* session (debug, `--synth <ms>`): one agent waiting, one
+/// that hits an error at 2.5s, and one that just finished.
 pub fn synth(header: String) -> Session {
     let agents = vec![
         Agent {
@@ -74,6 +77,7 @@ pub fn synth(header: String) -> Session {
             size: "\u{b7}".into(),
             bob: 0,
             error: false,
+            error_at: None,
         },
         Agent {
             name: "researcher".into(),
@@ -85,6 +89,7 @@ pub fn synth(header: String) -> Session {
             size: "\u{b7}".into(),
             bob: 3,
             error: true,
+            error_at: Some(2500),
         },
         Agent {
             name: "test-runner".into(),
@@ -96,6 +101,7 @@ pub fn synth(header: String) -> Session {
             size: "1.2kb".into(),
             bob: 6,
             error: false,
+            error_at: None,
         },
     ];
     Session {
@@ -123,7 +129,7 @@ fn build_events(agents: &[Agent], all: i64) -> Vec<Event> {
         let mut k = 0i64;
         while act + k * 1600 < finish {
             let tt = act + k * 1600;
-            let in_wait = a.wait.map_or(false, |(s, e)| tt >= s && tt < e);
+            let in_wait = a.wait.is_some_and(|(s, e)| tt >= s && tt < e);
             if !in_wait {
                 let tl = &a.tools[(k as usize) % a.tools.len()];
                 ev.push(Event {

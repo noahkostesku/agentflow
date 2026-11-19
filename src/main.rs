@@ -105,20 +105,27 @@ fn main() -> io::Result<()> {
     );
     match resolved {
         Some(r) => {
-            // Prefer the real cwd recorded in the transcript (handles --session
-            // and fallback, where the storage dir name is path-encoded).
-            let hdr_dir = transcript::read_cwd(&r.path)
-                .or_else(|| r.project_dir.clone())
-                .unwrap_or_else(|| cwd.clone());
-            let mut live = transcript::Live::new(&r, header_for(&hdr_dir));
-            live.refresh();
+            let live = open_live(&r, &cwd);
             if let Some(ms) = cli.frame {
                 let sess = live.build();
                 let t = live.clock();
                 print_ansi(&render::frame(&sess, t, ms, cli.calm, &mut rng));
                 return Ok(());
             }
-            run_live(live, cli.calm)
+            // Follow newer sessions unless pinned to one with --session.
+            let follow = cli.session.is_none().then(|| Follow {
+                project: cli.project.as_ref().map(PathBuf::from),
+                cwd: cwd.clone(),
+                fell_back: r.fell_back,
+            });
+            run_live(live, cli.calm, follow)
+        }
+        None if cli.session.is_some() => {
+            eprintln!(
+                "agentflow: no session \"{}\" found under ~/.claude/projects",
+                cli.session.as_deref().unwrap_or_default()
+            );
+            std::process::exit(1);
         }
         None => {
             // Nothing to watch anywhere — fall back to the demo so the tool
@@ -131,6 +138,42 @@ fn main() -> io::Result<()> {
             run_demo(&sess, cli.calm)
         }
     }
+}
+
+/// Attach to a resolved session and read what's already on disk. The header
+/// uses the real cwd recorded in the transcript (handles --session and the
+/// fallback, where the storage dir name is path-encoded).
+fn open_live(r: &discovery::Resolved, cwd: &Path) -> transcript::Live {
+    let hdr_dir = transcript::read_cwd(&r.path)
+        .or_else(|| r.project_dir.clone())
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let mut live = transcript::Live::new(r, header_for(&hdr_dir));
+    live.refresh();
+    live
+}
+
+/// Auto-switch settings for live mode (absent when pinned with --session).
+struct Follow {
+    project: Option<PathBuf>,
+    cwd: PathBuf,
+    fell_back: bool,
+}
+
+/// Re-scan for a session that has become newer than the one we're watching.
+/// Started in a directory with sessions: only that directory's sessions are
+/// candidates. Started on the global fallback: a session appearing in our own
+/// directory (or a newer global one) wins. A candidate must have been active
+/// at least 5s more recently than the current session, so two sessions that
+/// are both busy don't make the view flip back and forth.
+fn newer_session(follow: &Follow, current: &Path) -> Option<discovery::Resolved> {
+    let cand = discovery::resolve(None, follow.project.as_deref())?;
+    if cand.path == current || (!follow.fell_back && cand.fell_back) {
+        return None;
+    }
+    let ahead = discovery::activity(&cand.path)
+        .duration_since(discovery::activity(current))
+        .unwrap_or_default();
+    (ahead >= Duration::from_secs(5)).then_some(cand)
 }
 
 /// Build the header "agentflow // <project> // <hash>" from a directory.
@@ -157,6 +200,14 @@ fn short_hash(s: &str) -> String {
 // ---- terminal setup / teardown ---------------------------------------------
 
 fn enter() -> io::Result<Term> {
+    // If anything panics, put the terminal back before the message prints,
+    // instead of leaving the user's shell in raw mode on the alternate screen.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(io::stdout(), terminal::LeaveAlternateScreen, cursor::Show);
+        default_hook(info);
+    }));
     let mut out = io::stdout();
     terminal::enable_raw_mode()?;
     execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
@@ -239,15 +290,32 @@ fn run_demo(sess: &model::Session, mut calm: bool) -> io::Result<()> {
 
 // ---- live loop (real clock, refresh from disk ~3x/sec) ---------------------
 
-fn run_live(mut live: transcript::Live, mut calm: bool) -> io::Result<()> {
+fn run_live(
+    mut live: transcript::Live,
+    mut calm: bool,
+    mut follow: Option<Follow>,
+) -> io::Result<()> {
     let mut term = enter()?;
     let mut rng = rand::thread_rng();
-    let app_start = Instant::now();
+    let mut app_start = Instant::now();
     let mut last_refresh = Instant::now();
+    let mut last_scan = Instant::now();
     let mut sess = live.build();
 
     let res = (|| -> io::Result<()> {
         loop {
+            // Every ~2s, hop to a newer session (unless pinned by --session).
+            if last_scan.elapsed() >= Duration::from_secs(2) {
+                last_scan = Instant::now();
+                if let Some(fw) = follow.as_mut() {
+                    if let Some(next) = newer_session(fw, live.path()) {
+                        fw.fell_back = next.fell_back;
+                        live = open_live(&next, &fw.cwd);
+                        sess = live.build();
+                        app_start = Instant::now(); // replay the header intro
+                    }
+                }
+            }
             if last_refresh.elapsed() >= Duration::from_millis(300) {
                 live.refresh();
                 sess = live.build();
@@ -299,4 +367,46 @@ fn print_ansi(lines: &[Line<'static>]) {
     }
     print!("{buf}");
     let _ = io::stdout().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::time::SystemTime;
+
+    fn touch(path: &Path, secs_ago: u64) {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let f = File::create(path).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(secs_ago)).unwrap();
+    }
+
+    /// Synthetic ~/.claude/projects: a stale session and a fresh one in the same
+    /// project. We follow the fresh one — unless a background agent is still
+    /// writing to the stale session's subagent files, in which case it's active
+    /// and we stay put.
+    #[test]
+    fn auto_switch_follows_newer_session_in_same_dir() {
+        let home = std::env::temp_dir().join(format!("aflow-home-{}", std::process::id()));
+        std::env::set_var("HOME", &home);
+        let project = PathBuf::from("/work/demo-proj");
+        let pdir = discovery::projects_root().join(discovery::encode_path(&project));
+        let old = pdir.join("old-session.jsonl");
+        let new = pdir.join("new-session.jsonl");
+        touch(&old, 120);
+        touch(&new, 0);
+
+        let follow = Follow { project: Some(project.clone()), cwd: project.clone(), fell_back: false };
+        let next = newer_session(&follow, &old).expect("should switch to the newer session");
+        assert_eq!(next.path, new);
+        assert!(newer_session(&follow, &new).is_none(), "already on the newest");
+
+        // A background agent keeps the old session alive: no switch.
+        touch(&pdir.join("old-session").join("subagents").join("agent-x.jsonl"), 0);
+        assert!(newer_session(&follow, &old).is_none(), "busy session must not be dropped");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

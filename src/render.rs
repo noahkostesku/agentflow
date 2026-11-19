@@ -37,9 +37,7 @@ fn pad(s: &str, n: usize) -> String {
     if len >= n {
         s.chars().take(n).collect()
     } else {
-        let mut r = s.to_string();
-        r.extend(std::iter::repeat(' ').take(n - len));
-        r
+        format!("{s}{}", " ".repeat(n - len))
     }
 }
 
@@ -49,10 +47,7 @@ fn lpad(s: &str, n: usize) -> String {
     if len >= n {
         s.to_string()
     } else {
-        let mut r = String::new();
-        r.extend(std::iter::repeat(' ').take(n - len));
-        r.push_str(s);
-        r
+        format!("{}{s}", " ".repeat(n - len))
     }
 }
 
@@ -148,8 +143,11 @@ fn row(
     let done = matches!(fo, Some(f) if t >= f + 400);
     let ret = matches!(fo, Some(f) if t >= f && t < f + 400);
     let dim = matches!(fo, Some(f) if t >= f + 1700);
-    let wait = a.wait.map_or(false, |(ws, we)| t >= ws && t < we);
+    let wait = a.wait.is_some_and(|(ws, we)| t >= ws && t < we);
     let boot = r < 1300;
+    // ~300ms glitch the moment an error lands (spec: "Error: ~300ms glitch").
+    let glitching =
+        a.error && !calm && a.error_at.is_some_and(|e| t >= e && t < e + 300);
 
     // Node marker.
     let mut mk = "●";
@@ -174,7 +172,12 @@ fn row(
 
     // Name types out during boot.
     let shown = ((r - 800) / 30).max(0) as usize;
-    s.push(sp(pad(&ctake(&a.name, shown), 12), if dim { D } else { B }));
+    let mut name = ctake(&a.name, shown);
+    if glitching {
+        name = glitch(&name, calm, rng);
+    }
+    let name_c = if glitching { RED } else if dim { D } else { B };
+    s.push(sp(pad(&name, 12), name_c));
 
     // Current tool: real (live) or time-cycled (demo). May be absent early live.
     let tl: Option<&Tool> = if a.tools.is_empty() {
@@ -190,7 +193,7 @@ fn row(
     let face;
     let mut fc = G;
     if a.error {
-        face = "(×_×)".into();
+        face = if glitching { glitch("(×_×)", calm, rng) } else { "(×_×)".into() };
         fc = RED;
     } else if boot {
         face = if r < 1100 { "(·_·)" } else { "(•_•)" }.to_string();
@@ -213,7 +216,7 @@ fn row(
     let st;
     let mut sc = G;
     if a.error {
-        st = "error".into();
+        st = if glitching { glitch("error", calm, rng) } else { "error".into() };
         sc = RED;
     } else if boot {
         let stage = ((r - 800) / 170).clamp(0, 2) as usize;
@@ -386,11 +389,18 @@ pub fn frame(
     }
     out.push(Line::from(o));
 
-    // --- Tree of up to 3 visible agents (most-recent spawns when more exist).
+    // --- Tree of up to 3 visible agents. When more exist, agents still working
+    // (or just finished) win over long-done ones, newest first; the chosen rows
+    // are then shown in spawn order.
     let mut vis: Vec<&Agent> = sess.agents.iter().filter(|a| t >= a.spawn).collect();
     if vis.len() > 3 {
-        let start = vis.len() - 3;
-        vis = vis.split_off(start);
+        let settled = |a: &Agent| a.finish.is_some_and(|f| t >= f + 1700);
+        let mut idx: Vec<usize> = (0..vis.len()).collect();
+        // unsettled first, then by recency (later index = newer spawn)
+        idx.sort_by_key(|&i| (settled(vis[i]), std::cmp::Reverse(i)));
+        idx.truncate(3);
+        idx.sort_unstable();
+        vis = idx.into_iter().map(|i| vis[i]).collect();
     }
     out.push(if vis.is_empty() {
         Line::from("")
@@ -420,8 +430,8 @@ pub fn frame(
         if let Some(e) = tail.get(i) {
             let detail_color = if e.detail.starts_with('?') {
                 AM
-            } else if e.color == AC {
-                AC
+            } else if e.color == AC || e.color == RED {
+                e.color
             } else {
                 G
             };

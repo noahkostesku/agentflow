@@ -36,7 +36,7 @@ pub struct Agent {
     pub spawn: i64,
     /// when it returned a result; `None` = still running (live, unknown end)
     pub finish: Option<i64>,
-    /// optional [start, end) window where it blocks on a permission prompt
+    /// optional [start, end) window where it is blocked (amber "waiting")
     pub wait: Option<(i64, i64)>,
     /// tools it works through
     pub tools: Vec<Tool>,
@@ -47,8 +47,10 @@ pub struct Agent {
     pub size: String,
     /// per-agent phase offset so blinks/spinners don't march in lockstep
     pub bob: i64,
-    /// agent ended in error
+    /// agent is in error (a denied/blocked tool call was its latest outcome)
     pub error: bool,
+    /// when the error happened (session ms) — drives the brief error glitch
+    pub error_at: Option<i64>,
 }
 
 /// A line in the scrolling handoff/tool log.

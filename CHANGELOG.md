@@ -6,6 +6,14 @@ All notable changes to agentflow. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-19
+
+Two new ways to look across sessions instead of at one. The inbox answers
+"which of my agents needs me right now?" across every project and harness,
+with desktop notifications. The profiler answers "is my workflow getting
+better or worse, and which agent should I fix?" from a history of finished
+runs.
+
 ### Added
 
 - **Inbox** (`agentflow inbox`, or `i` from any view): every session active
@@ -21,14 +29,42 @@ All notable changes to agentflow. The format follows
   change per session, silent on startup, with per-state toggles, quiet
   hours and a repeat guard in `[notify]`. `--dry-run` and `--once` for
   checking it.
-- Config: `[inbox] active_minutes`, and `[notify]` (`waiting`, `error`,
-  `stuck`, `done`, `quiet`, `repeat_after`).
+- Config: `[inbox] active_minutes`, `[notify]` (`waiting`, `error`,
+  `stuck`, `done`, `quiet`, `repeat_after`), and `[workflows.<name>]`.
 - **Closed sessions** in the inbox: a waiting or working session whose
   `claude` / `codex` process is gone (terminal closed, process killed) shows
   dim as "closed while waiting" below the urgent states, instead of needing
   you forever. Processes are matched by session id on the command line, else
   by working directory; where they can't be seen, 12 hours of quiet marks a
   session stale.
+- **Run history** for the profiler: every finished session is recorded as a
+  run in `~/.agentflow/runs.jsonl` (append-only, one JSON object per line):
+  project, harness, start, wall time (the orchestrator's work included),
+  total agent time, critical path, peak and average concurrency, ≈cost and
+  tokens per agent (role and model), tool calls, errors, and outcome (did the
+  last test command pass, did any agent end in error or never report back).
+  Live mode records a session 30s after its batch of agents finishes and on
+  exit, including sessions opened from the inbox; `profile` and `compare`
+  also index the current project's sessions that have been quiet for 10
+  minutes. Needs `persistence`.
+- **Workflows**: runs group by project plus the set of agent roles (a Codex
+  subagent counts by its path, not its per-run nickname). Name one, and
+  group runs that sometimes add an extra agent, with `[workflows.<name>]`
+  (`roles`, optional `project`) in the config, or tag runs while watching
+  with `--workflow <name>`.
+- **`agentflow profile`**: your workflows with run count, median wall time,
+  median ≈cost and a braille trend. `Enter` opens one: wall and cost trends
+  over the last 20 runs (`--last N`), an outcome strip, a per-role table
+  (median time, ≈cost, model, share of runs on the critical path), recent
+  runs, and up to three plain-language insights once there are 5 runs. A
+  role or the whole run more than 25% slower or costlier than its median
+  over the previous 10 runs is flagged in amber. `--print` prints the screen
+  once; piped output is plain text. `profile --demo` shows seeded history
+  (12 runs, one regression).
+- **`agentflow compare <a> <b>`**: two runs side by side (wall and agent
+  time, cost, tokens, agents, concurrency, critical path, tool calls,
+  outcome, then per role), across harnesses too. A run is a number counting
+  back from the latest (within `--workflow` if given) or a session id prefix.
 
 ### Changed
 
@@ -141,4 +177,6 @@ a normalized event schema, two more views, cost and stats, lifetime history and
 First release: a live tree view of a Claude Code session's subagents, with a
 looping `--demo` and a `--calm` mode.
 
+[Unreleased]: https://github.com/noahkostesku/agentflow/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/noahkostesku/agentflow/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/noahkostesku/agentflow/releases/tag/v0.2.0
